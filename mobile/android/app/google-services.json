@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "303573382434",
+    "project_id": "gg-ev-charging-mgmt-1fc01",
+    "storage_bucket": "gg-ev-charging-mgmt-1fc01.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:303573382434:android:b05412f098bada78e0217b",
+        "android_client_info": {
+          "package_name": "com.example.ev_charging_management"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC6RVERMyodc4ldUc-QLbZZC07jvIpiQ9Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:303573382434:android:3d955c71290d22d5e0217b",
+        "android_client_info": {
+          "package_name": "com.gloriagrand.evchargingmanagement"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC6RVERMyodc4ldUc-QLbZZC07jvIpiQ9Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,6 @@
+firebase-admin==6.5.0
+pydantic==2.8.2
+reportlab==4.2.2
+python-dateutil==2.9.0.post0
+google-api-python-client==2.176.0
+google-auth==2.40.3
