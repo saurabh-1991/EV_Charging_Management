@@ -1,7 +1,8 @@
 .DS_Store
 
 # Build artifacts and distributables
-mobile/dist/
+mobile/dist/*
+!mobile/dist/.gitkeep
 mobile/ios/build/
 mobile/build/
 
