@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myUid() {
+      return request.auth.uid;
+    }
+
+    function myUser() {
+      return get(/databases/$(database)/documents/users/$(myUid())).data;
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+          exists(/databases/$(database)/documents/users/$(myUid())) &&
+          myUser().role == 'admin' &&
+          myUser().status == 'active';
+    }
+
+    function isActiveUser() {
+      return signedIn() &&
+          exists(/databases/$(database)/documents/users/$(myUid())) &&
+          myUser().status == 'active';
+    }
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (signedIn() && myUid() == userId);
+      allow create: if signedIn() &&
+          myUid() == userId &&
+          request.resource.data.role == 'resident' &&
+          request.resource.data.status == 'pending';
+      allow update: if isAdmin() ||
+          (signedIn() &&
+              myUid() == userId &&
+              request.resource.data.role == resource.data.role &&
+              request.resource.data.status == resource.data.status);
+      allow delete: if false;
+    }
+
+    match /appConfig/{docId} {
+      allow read: if isActiveUser();
+      allow write: if isAdmin();
+    }
+
+    match /chargingSlots/{slotId} {
+      allow read: if isActiveUser();
+      allow write: if isAdmin();
+    }
+
+    match /chargingSessions/{sessionId} {
+      allow read: if isAdmin() ||
+          (isActiveUser() && resource.data.ownerUid == myUid());
+      allow create: if isActiveUser() &&
+          request.resource.data.ownerUid == myUid();
+      allow update: if isAdmin() ||
+          (isActiveUser() && resource.data.ownerUid == myUid());
+      allow delete: if false;
+    }
+
+    match /slotBookings/{bookingId} {
+      allow read: if isActiveUser();
+      allow create: if isActiveUser() &&
+          request.resource.data.ownerUid == myUid();
+      allow update: if isAdmin() ||
+          (isActiveUser() && resource.data.ownerUid == myUid()) ||
+          (isActiveUser() &&
+              resource.data.status == 'booked' &&
+              request.resource.data.status in ['overridden', 'used'] &&
+              request.resource.data.ownerUid == resource.data.ownerUid &&
+              (
+                (request.resource.data.status == 'used' &&
+                    request.resource.data.ownerUid == myUid()) ||
+                (request.resource.data.status == 'overridden' &&
+                    request.resource.data.overriddenByUid == myUid())
+              ));
+      allow delete: if false;
+    }
+
+    match /payments/{paymentId} {
+      allow read: if isAdmin() ||
+          (isActiveUser() && resource.data.ownerUid == myUid());
+      allow create: if isActiveUser() &&
+          request.resource.data.ownerUid == myUid();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

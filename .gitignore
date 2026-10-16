@@ -1,0 +1,10 @@
+.DS_Store
+
+# Build artifacts and distributables
+mobile/dist/
+mobile/ios/build/
+mobile/build/
+
+# Python cache
+services/billing/__pycache__/
+*.pyc
