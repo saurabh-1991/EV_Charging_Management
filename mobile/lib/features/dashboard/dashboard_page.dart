@@ -1,11 +1,15 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:intl/intl.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
+import '../../core/flat_billing.dart';
+import '../../core/flat_payment_linker.dart';
 import '../admin/admin_page.dart';
 import '../billing/billing_page.dart';
-import '../booking/slot_booking_page.dart';
-import '../payments/payment_page.dart';
 import '../sessions/session_entry_page.dart';
 
 class DashboardPage extends StatelessWidget {
@@ -67,6 +71,7 @@ class DashboardPage extends StatelessWidget {
                 );
               },
             ),
+          if (uid.isNotEmpty && firebaseReady) _homeSnapshot(uid),
           if (!firebaseReady)
             const Card(
               child: ListTile(
@@ -82,21 +87,9 @@ class DashboardPage extends StatelessWidget {
           ),
           _menuTile(
             context: context,
-            title: 'Book Charging Slot',
-            subtitle: 'Reserve available charging time slots.',
-            routeName: SlotBookingPage.routeName,
-          ),
-          _menuTile(
-            context: context,
             title: 'View Bills',
             subtitle: 'See monthly units consumed and charges.',
             routeName: BillingPage.routeName,
-          ),
-          _menuTile(
-            context: context,
-            title: 'Pay Bill (Low-Cost Model)',
-            subtitle: 'UPI/bank transfer with transaction reference upload.',
-            routeName: PaymentPage.routeName,
           ),
           if (isAdmin)
             _menuTile(
@@ -105,8 +98,179 @@ class DashboardPage extends StatelessWidget {
               subtitle: 'Approve users, manage access and monitor usage.',
               routeName: AdminPage.routeName,
             ),
+          if (firebaseReady) _liveChargingStatusCard(),
         ],
       ),
+    );
+  }
+
+  Widget _homeSnapshot(String uid) {
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream:
+          FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+      builder: (BuildContext context,
+          AsyncSnapshot<DocumentSnapshot<Map<String, dynamic>>> userSnap) {
+        final Map<String, dynamic>? userData = userSnap.data?.data();
+        final FlatProfileScope? scope = FlatProfileScope.fromUser(userData);
+        if (scope != null) {
+          FlatPaymentLinker.ensureOwn(uid, scope);
+        }
+        final Query<Map<String, dynamic>> sessionQuery = scope == null
+            ? FirebaseFirestore.instance
+                .collection('chargingSessions')
+                .where('ownerUid', isEqualTo: uid)
+            : FirebaseFirestore.instance
+                .collection('chargingSessions')
+                .where('wing', isEqualTo: scope.wing)
+                .where('flatNumber', isEqualTo: scope.flat);
+        return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: sessionQuery.snapshots(),
+          builder: (BuildContext context,
+              AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>> sessionSnap) {
+            return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('payments')
+                  .where('ownerUid', isEqualTo: uid)
+                  .snapshots(),
+              builder: (BuildContext context,
+                  AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>>
+                      ownPaySnap) {
+                return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                  stream: scope == null
+                      ? null
+                      : FirebaseFirestore.instance
+                          .collection('payments')
+                          .where('billingFlatKey', isEqualTo: scope.key)
+                          .snapshots(),
+                  builder: (BuildContext context,
+                      AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>>
+                          flatPaySnap) {
+                    if (sessionSnap.hasError ||
+                        ownPaySnap.hasError ||
+                        flatPaySnap.hasError) {
+                      return const Card(
+                        child: ListTile(
+                          title: Text('Usage snapshot unavailable'),
+                          subtitle:
+                              Text('Could not load dues and consumption.'),
+                        ),
+                      );
+                    }
+                    if (!sessionSnap.hasData ||
+                        !ownPaySnap.hasData ||
+                        (scope != null && !flatPaySnap.hasData)) {
+                      return const Card(
+                        child: Padding(
+                          padding: EdgeInsets.all(20),
+                          child: Center(child: CircularProgressIndicator()),
+                        ),
+                      );
+                    }
+                    final Map<String, Map<String, dynamic>> paymentData =
+                        FlatBillMath.dedupePayments(<MapEntry<String,
+                            Map<String, dynamic>>>[
+                      ...ownPaySnap.data!.docs.map(
+                        (QueryDocumentSnapshot<Map<String, dynamic>> doc) =>
+                            MapEntry<String, Map<String, dynamic>>(
+                                doc.id, doc.data()),
+                      ),
+                      ...?flatPaySnap.data?.docs.map(
+                        (QueryDocumentSnapshot<Map<String, dynamic>> doc) =>
+                            MapEntry<String, Map<String, dynamic>>(
+                                doc.id, doc.data()),
+                      ),
+                    ]);
+                    final FlatBillTotals totals = FlatBillMath.summarize(
+                      sessions: sessionSnap.data!.docs.map(
+                          (QueryDocumentSnapshot<Map<String, dynamic>> doc) =>
+                              doc.data()),
+                      payments: paymentData.values,
+                      scope: scope,
+                      viewerUid: uid,
+                    );
+                    final double units = totals.units;
+                    final double billed = totals.billed;
+                    final double paid = totals.paid;
+                    final double due = totals.due;
+                    final double paidRatio =
+                        billed <= 0 ? 1 : (paid / billed).clamp(0, 1);
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(18),
+                          gradient: const LinearGradient(
+                            colors: <Color>[
+                              Color(0xFF0F766E),
+                              Color(0xFF115E59)
+                            ],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
+                        ),
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            const Text(
+                              'Your charging snapshot',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 16,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              scope == null
+                                  ? 'Total usage and outstanding amount'
+                                  : 'Combined for flat ${scope.wing}-${scope.flat}',
+                              style: const TextStyle(
+                                  color: Colors.white70, fontSize: 12),
+                            ),
+                            const SizedBox(height: 14),
+                            Row(
+                              children: <Widget>[
+                                Expanded(
+                                  child: _GraphMetric(
+                                    title: 'Total Consumption',
+                                    value: '${units.toStringAsFixed(1)} kWh',
+                                    caption: 'Completed sessions',
+                                    progress: units <= 0 ? 0.08 : 0.78,
+                                    color: const Color(0xFF5EEAD4),
+                                    icon: Icons.bolt,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: _GraphMetric(
+                                    title: 'Total Dues',
+                                    value: 'INR ${due.toStringAsFixed(0)}',
+                                    caption: due <= 0
+                                        ? 'All clear'
+                                        : 'Paid ${(paidRatio * 100).toStringAsFixed(0)}%',
+                                    progress: due <= 0 ? 1 : (1 - paidRatio),
+                                    color: due <= 0
+                                        ? const Color(0xFF86EFAC)
+                                        : const Color(0xFFFDBA74),
+                                    icon: Icons.account_balance_wallet,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 14),
+                            const _PublishedVersionBanner(),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            );
+          },
+        );
+      },
     );
   }
 
@@ -138,6 +302,70 @@ class DashboardPage extends StatelessWidget {
     );
   }
 
+  Widget _liveChargingStatusCard() {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance
+          .collection('chargingSlots')
+          .where('occupied', isEqualTo: true)
+          .snapshots(),
+      builder: (BuildContext context,
+          AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>> snapshot) {
+        if (!snapshot.hasData) {
+          return const Card(
+            child: ListTile(
+              title: Text('Current Charging Status'),
+              subtitle: Text('Loading active slots...'),
+            ),
+          );
+        }
+        final List<QueryDocumentSnapshot<Map<String, dynamic>>> docs =
+            snapshot.data!.docs;
+        if (docs.isEmpty) {
+          return const Card(
+            child: ListTile(
+              title: Text('Current Charging Status'),
+              subtitle: Text('All charging points are currently available.'),
+            ),
+          );
+        }
+        return Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  'Current Charging Status',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                ...docs.map((QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+                  final Map<String, dynamic> data = doc.data();
+                  final DateTime? startedAt =
+                      (data['startedAt'] as Timestamp?)?.toDate();
+                  final String sinceText = startedAt == null
+                      ? '-'
+                      : DateFormat('dd MMM, hh:mm a').format(startedAt);
+                  final String resident =
+                      (data['residentName'] ?? '-').toString();
+                  final String flat = (data['flatNumber'] ?? '-').toString();
+                  final String vehicle =
+                      (data['vehicleNumber'] ?? '-').toString();
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      '${doc.id}: $vehicle | $resident ($flat) | Since $sinceText',
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _menuTile({
     required BuildContext context,
     required String title,
@@ -151,6 +379,147 @@ class DashboardPage extends StatelessWidget {
         trailing: const Icon(Icons.arrow_forward_ios),
         onTap: () => Navigator.pushNamed(context, routeName),
       ),
+    );
+  }
+}
+
+class _GraphMetric extends StatelessWidget {
+  const _GraphMetric({
+    required this.title,
+    required this.value,
+    required this.caption,
+    required this.progress,
+    required this.color,
+    required this.icon,
+  });
+
+  final String title;
+  final String value;
+  final String caption;
+  final double progress;
+  final Color color;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        children: <Widget>[
+          SizedBox(
+            width: 78,
+            height: 78,
+            child: CustomPaint(
+              painter: _RingPainter(progress: progress, color: color),
+              child: Center(
+                child: Icon(icon, color: color, size: 22),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w800,
+              fontSize: 16,
+            ),
+          ),
+          Text(
+            caption,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white60, fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RingPainter extends CustomPainter {
+  _RingPainter({required this.progress, required this.color});
+
+  final double progress;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Offset center = Offset(size.width / 2, size.height / 2);
+    final double radius = math.min(size.width, size.height) / 2 - 6;
+    final Paint track = Paint()
+      ..color = Colors.white24
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8
+      ..strokeCap = StrokeCap.round;
+    final Paint arc = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8
+      ..strokeCap = StrokeCap.round;
+    canvas.drawCircle(center, radius, track);
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      -math.pi / 2,
+      math.pi * 2 * progress.clamp(0, 1),
+      false,
+      arc,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _RingPainter oldDelegate) {
+    return oldDelegate.progress != progress || oldDelegate.color != color;
+  }
+}
+
+class _PublishedVersionBanner extends StatelessWidget {
+  const _PublishedVersionBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<PackageInfo>(
+      future: PackageInfo.fromPlatform(),
+      builder: (BuildContext context, AsyncSnapshot<PackageInfo> packageSnap) {
+        final String installed = packageSnap.data?.version ?? '-';
+        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: FirebaseFirestore.instance
+              .collection('appConfig')
+              .doc('appVersion')
+              .snapshots(),
+          builder: (BuildContext context,
+              AsyncSnapshot<DocumentSnapshot<Map<String, dynamic>>> snapshot) {
+            final String published = ((snapshot.data?.data() ??
+                        <String, dynamic>{})['currentVersion'] ??
+                    '')
+                .toString();
+            final String shown =
+                published.isEmpty ? 'Not published yet' : published;
+            return Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                'App version: $shown\nInstalled on this phone: $installed',
+                style: const TextStyle(color: Colors.white, height: 1.35),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }

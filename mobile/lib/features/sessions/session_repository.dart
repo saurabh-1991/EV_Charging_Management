@@ -1,6 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 
+import '../../core/flat_billing.dart';
+
 class SessionRepository {
   SessionRepository(this._firestore);
 
@@ -14,10 +16,29 @@ class SessionRepository {
     required String flatNumber,
     required int chargingPoint,
     required String vehicleNumber,
+    required bool isGuestVehicle,
     required double startMeter,
     required double ratePerUnit,
   }) async {
+    if (startMeter < 0) {
+      throw FirebaseException(
+        plugin: 'cloud_firestore',
+        code: 'invalid-meter',
+        message: 'Start meter cannot be negative.',
+      );
+    }
+    final String normalizedWing = wing.trim();
     final String normalizedFlat = flatNumber.trim().toUpperCase();
+    final String? billingFlatKey =
+        FlatBillMath.flatKey(normalizedWing, normalizedFlat);
+    final String normalizedVehicle = vehicleNumber.trim().toUpperCase();
+    if (normalizedVehicle.isEmpty) {
+      throw FirebaseException(
+        plugin: 'cloud_firestore',
+        code: 'invalid-vehicle',
+        message: 'Vehicle number is required.',
+      );
+    }
     final String pointKey = _pointKey(wing, chargingPoint);
     final DocumentReference<Map<String, dynamic>> slotRef =
         _firestore.collection('chargingSlots').doc(pointKey);
@@ -32,7 +53,8 @@ class SessionRepository {
     final DocumentReference<Map<String, dynamic>> bookingRef =
         _firestore.collection('slotBookings').doc(bookingId);
 
-    return _firestore.runTransaction<String>((Transaction txn) async {
+    final String sessionId =
+        await _firestore.runTransaction<String>((Transaction txn) async {
       final DocumentSnapshot<Map<String, dynamic>> slotDoc =
           await txn.get(slotRef);
       if (slotDoc.exists && slotDoc.data()?['occupied'] == true) {
@@ -71,14 +93,18 @@ class SessionRepository {
 
       txn.set(sessionRef, <String, dynamic>{
         'ownerUid': ownerUid,
+        'billingOwnerUid': ownerUid,
         'residentName': residentName,
-        'wing': wing,
+        'wing': normalizedWing,
+        if (billingFlatKey != null) 'billingFlatKey': billingFlatKey,
         'floor': floor,
         'flat': normalizedFlat,
+        'billingFlatNumber': normalizedFlat,
         'flatNumber': normalizedFlat,
         'chargingPoint': chargingPoint,
         'pointKey': pointKey,
-        'vehicleNumber': vehicleNumber.toUpperCase(),
+        'vehicleNumber': normalizedVehicle,
+        'isGuestVehicle': isGuestVehicle,
         'startMeter': startMeter,
         'endMeter': null,
         'ratePerUnit': ratePerUnit,
@@ -102,26 +128,23 @@ class SessionRepository {
             'currentSessionId': sessionRef.id,
             'residentName': residentName,
             'flatNumber': normalizedFlat,
-            'vehicleNumber': vehicleNumber.toUpperCase(),
+            'vehicleNumber': normalizedVehicle,
             'startedAt': now,
-            'updatedAt': now,
-          },
-          SetOptions(merge: true));
-
-      final String vehicleDocId = _vehicleDocId(vehicleNumber);
-      txn.set(
-          _firestore.collection('vehicles').doc(vehicleDocId),
-          <String, dynamic>{
-            'vehicleNumber': vehicleNumber.toUpperCase(),
-            'wing': wing,
-            'flatNumber': normalizedFlat,
-            'lastChargedAt': now,
             'updatedAt': now,
           },
           SetOptions(merge: true));
 
       return sessionRef.id;
     });
+
+    // Non-critical analytics/profile data should not block charging.
+    await _upsertVehicleBestEffort(
+      vehicleNumber: normalizedVehicle,
+      wing: wing,
+      flatNumber: normalizedFlat,
+      lastChargedAt: now.toDate(),
+    );
+    return sessionId;
   }
 
   Future<void> stopChargingSession({
@@ -153,7 +176,8 @@ class SessionRepository {
     final Timestamp now = Timestamp.now();
     final String monthKey = DateFormat('yyyy-MM').format(now.toDate());
 
-    await _firestore.runTransaction((Transaction txn) async {
+    final Map<String, dynamic> completedData = await _firestore
+        .runTransaction<Map<String, dynamic>>((Transaction txn) async {
       final DocumentSnapshot<Map<String, dynamic>> sessionDoc =
           await txn.get(sessionRef);
       final Map<String, dynamic>? data = sessionDoc.data();
@@ -199,18 +223,16 @@ class SessionRepository {
             'updatedAt': now,
           },
           SetOptions(merge: true));
-
-      final String vehicleNumber = (data['vehicleNumber'] ?? '').toString();
-      final String vehicleDocId = _vehicleDocId(vehicleNumber);
-      txn.set(
-          _firestore.collection('vehicles').doc(vehicleDocId),
-          <String, dynamic>{
-            'totalSessions': FieldValue.increment(1),
-            'totalUnits': FieldValue.increment(units),
-            'updatedAt': now,
-          },
-          SetOptions(merge: true));
+      return <String, dynamic>{
+        'vehicleNumber': (data['vehicleNumber'] ?? '').toString(),
+        'units': units,
+      };
     });
+
+    await _incrementVehicleTotalsBestEffort(
+      vehicleNumber: completedData['vehicleNumber']?.toString() ?? '',
+      units: (completedData['units'] as num?)?.toDouble() ?? 0,
+    );
   }
 
   Stream<Map<String, PointSlotStatus>> watchPointStatuses() {
@@ -239,6 +261,21 @@ class SessionRepository {
     return _firestore
         .collection('chargingSessions')
         .where('pointKey', isEqualTo: pointKey)
+        .where('status', isEqualTo: 'active')
+        .limit(1)
+        .snapshots()
+        .map((QuerySnapshot<Map<String, dynamic>> snapshot) {
+      if (snapshot.docs.isEmpty) {
+        return null;
+      }
+      return _fromDoc(snapshot.docs.first);
+    });
+  }
+
+  Stream<ChargingSession?> watchActiveSessionForOwner(String ownerUid) {
+    return _firestore
+        .collection('chargingSessions')
+        .where('ownerUid', isEqualTo: ownerUid)
         .where('status', isEqualTo: 'active')
         .limit(1)
         .snapshots()
@@ -329,6 +366,7 @@ class SessionRepository {
       units: (data['units'] as num?)?.toDouble() ?? 0,
       amount: (data['amount'] as num?)?.toDouble() ?? 0,
       status: (data['status'] ?? 'completed').toString(),
+      isGuestVehicle: data['isGuestVehicle'] == true,
       startTime: (data['startTime'] as Timestamp?)?.toDate(),
       endTime: (data['endTime'] as Timestamp?)?.toDate(),
       createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
@@ -343,6 +381,51 @@ class SessionRepository {
   }
 
   String _pointKey(String wing, int point) => '${wing.toUpperCase()}-P$point';
+
+  Future<void> _upsertVehicleBestEffort({
+    required String vehicleNumber,
+    required String wing,
+    required String flatNumber,
+    required DateTime lastChargedAt,
+  }) async {
+    try {
+      final String vehicleDocId = _vehicleDocId(vehicleNumber);
+      await _firestore.collection('vehicles').doc(vehicleDocId).set(
+        <String, dynamic>{
+          'vehicleNumber': vehicleNumber,
+          'wing': wing,
+          'flatNumber': flatNumber,
+          'lastChargedAt': Timestamp.fromDate(lastChargedAt),
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+    } catch (_) {
+      // Intentionally ignored to keep start/stop charging resilient.
+    }
+  }
+
+  Future<void> _incrementVehicleTotalsBestEffort({
+    required String vehicleNumber,
+    required double units,
+  }) async {
+    if (vehicleNumber.trim().isEmpty) {
+      return;
+    }
+    try {
+      final String vehicleDocId = _vehicleDocId(vehicleNumber);
+      await _firestore.collection('vehicles').doc(vehicleDocId).set(
+        <String, dynamic>{
+          'totalSessions': FieldValue.increment(1),
+          'totalUnits': FieldValue.increment(units),
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+    } catch (_) {
+      // Intentionally ignored to keep start/stop charging resilient.
+    }
+  }
 }
 
 class PointSlotStatus {
@@ -380,6 +463,7 @@ class ChargingSession {
     required this.units,
     required this.amount,
     required this.status,
+    required this.isGuestVehicle,
     required this.startTime,
     required this.endTime,
     required this.createdAt,
@@ -400,6 +484,7 @@ class ChargingSession {
   final double units;
   final double amount;
   final String status;
+  final bool isGuestVehicle;
   final DateTime? startTime;
   final DateTime? endTime;
   final DateTime createdAt;

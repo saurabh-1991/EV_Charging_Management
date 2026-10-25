@@ -3,6 +3,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 
+import '../../core/flat_payment_linker.dart';
+
 class PaymentPage extends StatefulWidget {
   const PaymentPage({required this.firebaseReady, super.key});
 
@@ -27,51 +29,20 @@ class _PaymentPageState extends State<PaymentPage> {
 
   Future<void> _submitPaymentReference() async {
     final String uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-    final String txnRef = _txnRefController.text.trim().toUpperCase();
     final double amount = double.tryParse(_amountController.text.trim()) ?? 0;
-    if (uid.isEmpty) {
-      _toast('Please login first.');
+    final String? error = await FlatPaymentLinker.submitPaymentRequest(
+      uid: uid,
+      txnRef: _txnRefController.text,
+      amount: amount,
+      monthKey: DateFormat('yyyy-MM').format(DateTime.now()),
+    );
+    if (!mounted) {
       return;
     }
-    if (txnRef.isEmpty || amount <= 0) {
-      _toast('Enter valid amount and transaction reference.');
+    if (error != null) {
+      _toast(error);
       return;
     }
-    final String monthKey = DateFormat('yyyy-MM').format(DateTime.now());
-    final QuerySnapshot<Map<String, dynamic>> existing = await FirebaseFirestore
-        .instance
-        .collection('payments')
-        .where('ownerUid', isEqualTo: uid)
-        .where('monthKey', isEqualTo: monthKey)
-        .where('status', isEqualTo: 'submitted')
-        .limit(1)
-        .get();
-    if (existing.docs.isNotEmpty) {
-      _toast('A payment reference is already pending for this month.');
-      return;
-    }
-    final QuerySnapshot<Map<String, dynamic>> duplicateTxn =
-        await FirebaseFirestore.instance
-            .collection('payments')
-            .where('ownerUid', isEqualTo: uid)
-            .where('monthKey', isEqualTo: monthKey)
-            .where('txnRef', isEqualTo: txnRef)
-            .limit(1)
-            .get();
-    if (duplicateTxn.docs.isNotEmpty) {
-      _toast('This transaction reference already exists for this month.');
-      return;
-    }
-    await FirebaseFirestore.instance
-        .collection('payments')
-        .add(<String, dynamic>{
-      'ownerUid': uid,
-      'txnRef': txnRef,
-      'amount': amount,
-      'monthKey': monthKey,
-      'status': 'submitted',
-      'createdAt': FieldValue.serverTimestamp(),
-    });
     if (!mounted) {
       return;
     }
@@ -85,6 +56,19 @@ class _PaymentPageState extends State<PaymentPage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
+  }
+
+  String _statusLabel(String status) {
+    if (status == 'paid' || status == 'verified') {
+      return 'Paid';
+    }
+    if (status == 'submitted') {
+      return 'Pending Verification';
+    }
+    if (status == 'rejected') {
+      return 'Rejected';
+    }
+    return status;
   }
 
   @override
@@ -197,8 +181,11 @@ class _PaymentPageState extends State<PaymentPage> {
                           '${data['monthKey'] ?? '-'} | INR ${paid.toStringAsFixed(2)}',
                         ),
                         subtitle: Text(
-                          'Txn ${data['txnRef'] ?? '-'} | Status: ${data['status'] ?? 'submitted'}',
+                          'Txn ${data['txnRef'] ?? '-'} | Status: ${_statusLabel((data['status'] ?? 'submitted').toString())}'
+                          '${(data['requestedAt'] as Timestamp?) == null ? '' : '\nRequested: ${DateFormat('dd MMM yyyy, hh:mm a').format((data['requestedAt'] as Timestamp).toDate())}'}'
+                          '${((data['paidAt'] as Timestamp?) ?? (data['verifiedAt'] as Timestamp?)) == null ? '' : '\nUpdated: ${DateFormat('dd MMM yyyy, hh:mm a').format(((data['paidAt'] as Timestamp?) ?? (data['verifiedAt'] as Timestamp?))!.toDate())}'}',
                         ),
+                        isThreeLine: true,
                       ),
                     );
                   }),

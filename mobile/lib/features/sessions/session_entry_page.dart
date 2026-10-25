@@ -1,13 +1,8 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:excel/excel.dart' hide Border;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../../config/app_config.dart';
 import 'session_repository.dart';
@@ -23,23 +18,31 @@ class SessionEntryPage extends StatefulWidget {
 }
 
 class _SessionEntryPageState extends State<SessionEntryPage> {
+  static final RegExp _vehiclePattern =
+      RegExp(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{1,4}$');
+
   final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _wingController = TextEditingController();
   final TextEditingController _flatNumberController = TextEditingController();
-  final TextEditingController _vehicleController = TextEditingController();
+  final TextEditingController _guestNameController = TextEditingController();
+  final TextEditingController _guestVehicleController = TextEditingController();
+  final TextEditingController _manualVehicleController =
+      TextEditingController();
   final TextEditingController _startMeterController = TextEditingController();
   final TextEditingController _endMeterController = TextEditingController();
-  final TextEditingController _historyFilterController =
-      TextEditingController();
 
-  bool _isExporting = false;
   bool _isProcessingSession = false;
   bool _didAutoSelectOnLoad = false;
   bool _prefilledFromProfile = false;
-  String _historyFilter = '';
+  bool _profileVehicleEnsured = false;
+  bool _useGuestVehicle = false;
   String _displayName = '';
   String _displayEmail = '';
   bool _isAdmin = false;
+  List<String> _savedVehicles = <String>[];
+  String? _selectedVehicle;
   String _selectedWing = 'B1';
+  String _profileWing = 'B1';
   int _selectedPoint = 1;
   Timer? _clockTimer;
   late final SessionRepository _sessionRepository =
@@ -59,17 +62,20 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
   void dispose() {
     _clockTimer?.cancel();
     _nameController.dispose();
+    _wingController.dispose();
     _flatNumberController.dispose();
-    _vehicleController.dispose();
+    _guestNameController.dispose();
+    _guestVehicleController.dispose();
+    _manualVehicleController.dispose();
     _startMeterController.dispose();
     _endMeterController.dispose();
-    _historyFilterController.dispose();
     super.dispose();
   }
 
   String get _selectedPointKey =>
       '${_selectedWing.toUpperCase()}-P$_selectedPoint';
   String get _flatFilter => _flatNumberController.text.trim().toUpperCase();
+  String get _effectiveWing => _isAdmin ? _selectedWing : _profileWing;
 
   double _meter(TextEditingController controller) =>
       double.tryParse(controller.text.trim()) ?? 0;
@@ -81,6 +87,26 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     return parsed;
   }
 
+  String _normalizeVehicle(String vehicle) {
+    return vehicle.trim().toUpperCase().replaceAll(RegExp(r'[\s\-]'), '');
+  }
+
+  bool _isValidVehicle(String vehicle) {
+    return _vehiclePattern.hasMatch(_normalizeVehicle(vehicle));
+  }
+
+  String _effectiveVehicleNumber() {
+    if (_useGuestVehicle) {
+      return _normalizeVehicle(_guestVehicleController.text);
+    }
+    final String manualVehicle =
+        _normalizeVehicle(_manualVehicleController.text);
+    if (manualVehicle.isNotEmpty) {
+      return manualVehicle;
+    }
+    return _normalizeVehicle(_selectedVehicle ?? '');
+  }
+
   Future<void> _startCharging(double ratePerUnit) async {
     if (!widget.firebaseReady) {
       _toast('Firebase not configured yet.');
@@ -88,12 +114,24 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     }
 
     final String name = _nameController.text.trim();
+    final String guestName = _guestNameController.text.trim();
     final String ownerUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    final String sessionWing = _effectiveWing;
     final String flat = _flatFilter;
-    final String vehicle = _vehicleController.text.trim().toUpperCase();
+    final String vehicle = _effectiveVehicleNumber();
     final double startMeter = _meter(_startMeterController);
-    if (name.isEmpty || flat.isEmpty || vehicle.isEmpty) {
-      _toast('Enter Name, Flat Number and Vehicle Number.');
+    final String residentName =
+        _useGuestVehicle ? (guestName.isEmpty ? name : guestName) : name;
+    if (residentName.isEmpty || flat.isEmpty || vehicle.isEmpty) {
+      _toast('Profile details and vehicle number are required.');
+      return;
+    }
+    if (sessionWing.isEmpty) {
+      _toast('Wing is missing in profile. Contact admin.');
+      return;
+    }
+    if (!_isValidVehicle(vehicle)) {
+      _toast('Enter a valid vehicle number (example: MH12AB1234).');
       return;
     }
     if (ownerUid.isEmpty) {
@@ -107,12 +145,13 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     try {
       await _sessionRepository.startChargingSession(
         ownerUid: ownerUid,
-        residentName: name,
-        wing: _selectedWing,
+        residentName: residentName,
+        wing: sessionWing,
         floor: _deriveFloorFromFlat(flat),
         flatNumber: flat,
         chargingPoint: _selectedPoint,
         vehicleNumber: vehicle,
+        isGuestVehicle: _useGuestVehicle,
         startMeter: startMeter,
         ratePerUnit: ratePerUnit,
       );
@@ -120,9 +159,14 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
         return;
       }
       _endMeterController.clear();
+      if (_useGuestVehicle) {
+        _guestNameController.clear();
+        _guestVehicleController.clear();
+      }
+      _manualVehicleController.clear();
       await _successDialog('Charging started for $_selectedPointKey.');
     } on FirebaseException catch (e) {
-      _toast(e.message ?? e.code);
+      _toast(_friendlySessionError(e));
     } finally {
       if (mounted) {
         setState(() {
@@ -159,7 +203,7 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
       _endMeterController.clear();
       await _successDialog('Charging stopped. Slot is now available.');
     } on FirebaseException catch (e) {
-      _toast(e.message ?? e.code);
+      _toast(_friendlySessionError(e));
     } finally {
       if (mounted) {
         setState(() {
@@ -169,208 +213,21 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     }
   }
 
-  Future<void> _exportMyHistoryCsv() async {
-    if (!widget.firebaseReady) {
-      _toast('Firebase not configured yet.');
-      return;
+  String _friendlySessionError(FirebaseException error) {
+    if (error.code == 'permission-denied') {
+      return 'Permission denied for charging update. Please login again and retry.';
     }
-
-    setState(() {
-      _isExporting = true;
-    });
-    try {
-      final List<ChargingSession> sessions =
-          await _sessionRepository.fetchAllSessionsForExport(
-        ownerUid: _isAdmin ? null : FirebaseAuth.instance.currentUser?.uid,
-        wingFilter: _isAdmin ? _selectedWing : null,
-        flatNumberFilter: _isAdmin ? _flatFilter : null,
-      );
-      if (sessions.isEmpty) {
-        _toast('No sessions available for this flat.');
-        return;
-      }
-
-      final StringBuffer csv = StringBuffer();
-      csv.writeln(
-        'Name,Wing,Floor,Flat Number,Charging Point,Point Key,Vehicle Number,Status,Start Date,Start Time,End Date,End Time,Start Meter (kWh),End Meter (kWh),Units (kWh),Rate (INR),Amount (INR)',
-      );
-      for (final ChargingSession s in sessions) {
-        final String startDate = s.startTime == null
-            ? ''
-            : DateFormat('yyyy-MM-dd').format(s.startTime!);
-        final String startTime = s.startTime == null
-            ? ''
-            : DateFormat('HH:mm:ss').format(s.startTime!);
-        final String endDate = s.endTime == null
-            ? ''
-            : DateFormat('yyyy-MM-dd').format(s.endTime!);
-        final String endTime =
-            s.endTime == null ? '' : DateFormat('HH:mm:ss').format(s.endTime!);
-        csv.writeln(
-          '${_csv(s.residentName)},${s.wing},${s.floor},${s.flatNumber},P${s.chargingPoint},${s.pointKey},${_csv(s.vehicleNumber)},${s.status},$startDate,$startTime,$endDate,$endTime,${s.startMeter.toStringAsFixed(2)},${s.endMeter.toStringAsFixed(2)},${s.units.toStringAsFixed(2)},${s.ratePerUnit.toStringAsFixed(2)},${s.amount.toStringAsFixed(2)}',
-        );
-      }
-
-      final Directory directory = await getApplicationDocumentsDirectory();
-      final String filename =
-          'my_history_${_selectedWing}_${_flatFilter}_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.csv';
-      final File file = File('${directory.path}/$filename');
-      await file.writeAsString(csv.toString());
-      await Share.shareXFiles(<XFile>[XFile(file.path)],
-          subject: 'My Charging History');
-    } catch (_) {
-      _toast('Export failed. Please retry.');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isExporting = false;
-        });
-      }
+    if (error.code == 'slot-occupied') {
+      return error.message ?? 'Selected slot is currently unavailable.';
     }
-  }
-
-  Future<void> _exportAdminB1B2Excel() async {
-    if (!widget.firebaseReady) {
-      _toast('Firebase not configured yet.');
-      return;
+    if (error.code == 'invalid-meter') {
+      return error.message ?? 'Meter reading is invalid.';
     }
-    setState(() {
-      _isExporting = true;
-    });
-    try {
-      final List<ChargingSession> b1 =
-          await _sessionRepository.fetchAllSessionsForExport(
-        ownerUid: _isAdmin ? null : FirebaseAuth.instance.currentUser?.uid,
-        wingFilter: 'B1',
-      );
-      final List<ChargingSession> b2 =
-          await _sessionRepository.fetchAllSessionsForExport(
-        ownerUid: _isAdmin ? null : FirebaseAuth.instance.currentUser?.uid,
-        wingFilter: 'B2',
-      );
-      if (b1.isEmpty && b2.isEmpty) {
-        _toast('No data available for B1/B2 export.');
-        return;
-      }
-
-      final Excel excel = Excel.createExcel();
-      _writeWingSheet(excel, 'B1', b1);
-      _writeWingSheet(excel, 'B2', b2);
-      _writeSummarySheet(excel, b1, b2);
-      excel.delete('Sheet1');
-      final List<int>? bytes = excel.encode();
-      if (bytes == null) {
-        throw Exception('Excel generation failed');
-      }
-
-      final Directory directory = await getApplicationDocumentsDirectory();
-      final String filename =
-          'final_report_B1_B2_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.xlsx';
-      final File file = File('${directory.path}/$filename');
-      await file.writeAsBytes(bytes, flush: true);
-      await Share.shareXFiles(<XFile>[XFile(file.path)],
-          subject: 'Final EV Charging Report');
-      _toast('Final Excel report generated.');
-    } catch (_) {
-      _toast('Admin export failed. Please retry.');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isExporting = false;
-        });
-      }
+    if (error.code == 'failed-precondition') {
+      return 'Database index/config is still updating. Please retry in a minute.';
     }
+    return error.message ?? error.code;
   }
-
-  void _writeWingSheet(
-      Excel excel, String sheetName, List<ChargingSession> rows) {
-    final Sheet sheet = excel[sheetName];
-    sheet.appendRow(<CellValue>[
-      TextCellValue('Name'),
-      TextCellValue('Wing'),
-      TextCellValue('Floor'),
-      TextCellValue('Flat Number'),
-      TextCellValue('Charging Point'),
-      TextCellValue('Point Key'),
-      TextCellValue('Vehicle Number'),
-      TextCellValue('Status'),
-      TextCellValue('Start Date'),
-      TextCellValue('Start Time'),
-      TextCellValue('End Date'),
-      TextCellValue('End Time'),
-      TextCellValue('Start Meter'),
-      TextCellValue('End Meter'),
-      TextCellValue('Units'),
-      TextCellValue('Rate'),
-      TextCellValue('Amount'),
-    ]);
-
-    for (final ChargingSession s in rows) {
-      sheet.appendRow(<CellValue>[
-        TextCellValue(s.residentName),
-        TextCellValue(s.wing),
-        IntCellValue(s.floor),
-        TextCellValue(s.flatNumber),
-        TextCellValue('P${s.chargingPoint}'),
-        TextCellValue(s.pointKey),
-        TextCellValue(s.vehicleNumber),
-        TextCellValue(s.status),
-        TextCellValue(
-          s.startTime == null
-              ? ''
-              : DateFormat('yyyy-MM-dd').format(s.startTime!),
-        ),
-        TextCellValue(
-          s.startTime == null
-              ? ''
-              : DateFormat('HH:mm:ss').format(s.startTime!),
-        ),
-        TextCellValue(
-          s.endTime == null ? '' : DateFormat('yyyy-MM-dd').format(s.endTime!),
-        ),
-        TextCellValue(
-          s.endTime == null ? '' : DateFormat('HH:mm:ss').format(s.endTime!),
-        ),
-        DoubleCellValue(s.startMeter),
-        DoubleCellValue(s.endMeter),
-        DoubleCellValue(s.units),
-        DoubleCellValue(s.ratePerUnit),
-        DoubleCellValue(s.amount),
-      ]);
-    }
-  }
-
-  void _writeSummarySheet(
-      Excel excel, List<ChargingSession> b1, List<ChargingSession> b2) {
-    final Sheet sheet = excel['Summary'];
-    sheet.appendRow(<CellValue>[
-      TextCellValue('Wing'),
-      TextCellValue('Sessions'),
-      TextCellValue('Units (kWh)'),
-      TextCellValue('Amount (INR)'),
-    ]);
-    _appendSummaryRow(sheet, 'B1', b1);
-    _appendSummaryRow(sheet, 'B2', b2);
-    _appendSummaryRow(sheet, 'TOTAL', <ChargingSession>[...b1, ...b2]);
-  }
-
-  void _appendSummaryRow(
-      Sheet sheet, String label, List<ChargingSession> sessions) {
-    final List<ChargingSession> completed =
-        sessions.where((ChargingSession s) => s.status == 'completed').toList();
-    final double totalUnits =
-        completed.fold<double>(0, (double p, ChargingSession e) => p + e.units);
-    final double totalAmount = completed.fold<double>(
-        0, (double p, ChargingSession e) => p + e.amount);
-    sheet.appendRow(<CellValue>[
-      TextCellValue(label),
-      IntCellValue(completed.length),
-      DoubleCellValue(totalUnits),
-      DoubleCellValue(totalAmount),
-    ]);
-  }
-
-  String _csv(String value) => '"${value.replaceAll('"', '""')}"';
 
   void _toast(String message) {
     ScaffoldMessenger.of(context)
@@ -403,6 +260,46 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     return '${hours}h ${mins}m';
   }
 
+  Future<void> _ensureVehicleSchema(
+      String uid, Map<String, dynamic> profile) async {
+    if (_profileVehicleEnsured) {
+      return;
+    }
+    _profileVehicleEnsured = true;
+    final List<String> vehicles =
+        ((profile['vehicles'] as List<dynamic>?) ?? <dynamic>[])
+            .map((dynamic e) => _normalizeVehicle(e.toString()))
+            .where((String v) => v.isNotEmpty)
+            .toSet()
+            .toList();
+    final String legacyVehicle = _normalizeVehicle(
+      (profile['vehicleNumber'] ?? '').toString(),
+    );
+    final String defaultVehicle = _normalizeVehicle(
+      (profile['defaultVehicle'] ?? '').toString(),
+    );
+    if (legacyVehicle.isNotEmpty && !vehicles.contains(legacyVehicle)) {
+      vehicles.add(legacyVehicle);
+    }
+    if (vehicles.isEmpty) {
+      return;
+    }
+    final String resolvedDefault =
+        vehicles.contains(defaultVehicle) ? defaultVehicle : vehicles.first;
+    if ((profile['vehicles'] as List<dynamic>?) == null ||
+        profile['defaultVehicle'] != resolvedDefault) {
+      await FirebaseFirestore.instance.collection('users').doc(uid).set(
+        <String, dynamic>{
+          'vehicles': vehicles,
+          'defaultVehicle': resolvedDefault,
+          'vehicleNumber': resolvedDefault,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+    }
+  }
+
   void _hydrateProfile(Map<String, dynamic> profile, String email) {
     if (_prefilledFromProfile) {
       return;
@@ -416,16 +313,35 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     }
     final String wing = (profile['wing'] ?? '').toString().toUpperCase();
     final String flat = (profile['flatNumber'] ?? '').toString().toUpperCase();
-    final String vehicle =
-        (profile['vehicleNumber'] ?? '').toString().toUpperCase();
+    final String legacyVehicle = _normalizeVehicle(
+      (profile['vehicleNumber'] ?? '').toString(),
+    );
+    final String defaultVehicle = _normalizeVehicle(
+      (profile['defaultVehicle'] ?? '').toString(),
+    );
+    final List<String> vehicles =
+        ((profile['vehicles'] as List<dynamic>?) ?? <dynamic>[])
+            .map((dynamic e) => _normalizeVehicle(e.toString()))
+            .where((String value) => value.isNotEmpty)
+            .toSet()
+            .toList();
+    if (legacyVehicle.isNotEmpty && !vehicles.contains(legacyVehicle)) {
+      vehicles.add(legacyVehicle);
+    }
     if (wing == 'B1' || wing == 'B2') {
+      _profileWing = wing;
       _selectedWing = wing;
+      _wingController.text = wing;
+    } else if (_wingController.text.isEmpty) {
+      _wingController.text = _selectedWing;
     }
     if (flat.isNotEmpty) {
       _flatNumberController.text = flat;
     }
-    if (vehicle.isNotEmpty) {
-      _vehicleController.text = vehicle;
+    if (vehicles.isNotEmpty) {
+      _savedVehicles = vehicles;
+      _selectedVehicle =
+          vehicles.contains(defaultVehicle) ? defaultVehicle : vehicles.first;
     }
   }
 
@@ -467,8 +383,12 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     }
     _didAutoSelectOnLoad = true;
 
+    final Iterable<PointSlotStatus> allowedStatuses = _isAdmin
+        ? slotMap.values
+        : slotMap.values
+            .where((PointSlotStatus s) => s.pointKey.startsWith(_profileWing));
     PointSlotStatus? latest;
-    for (final PointSlotStatus status in slotMap.values) {
+    for (final PointSlotStatus status in allowedStatuses) {
       if (!status.occupied) {
         continue;
       }
@@ -496,14 +416,42 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
       }
       final List<String> parts = key.split('-P');
       setState(() {
-        _selectedWing = parts.first;
+        _selectedWing = _isAdmin ? parts.first : _profileWing;
+        _wingController.text = _selectedWing;
         _selectedPoint = int.tryParse(parts.last) ?? 1;
       });
     });
   }
 
+  void _autoSelectMyActivePoint(ChargingSession? session) {
+    if (session == null || session.pointKey == _selectedPointKey) {
+      return;
+    }
+    final List<String> parts = session.pointKey.split('-P');
+    if (parts.length != 2) {
+      return;
+    }
+    final String wing = parts.first;
+    final int point = int.tryParse(parts.last) ?? 1;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _selectedWing = _isAdmin ? wing : _profileWing;
+        _wingController.text = _selectedWing;
+        _selectedPoint = point;
+      });
+    });
+  }
+
   Widget _pointBoard(Map<String, PointSlotStatus> slotMap) {
-    final List<String> keys = <String>['B1-P1', 'B1-P2', 'B2-P1', 'B2-P2'];
+    final List<String> allKeys = <String>['B1-P1', 'B1-P2', 'B2-P1', 'B2-P2'];
+    final List<String> keys = _isAdmin
+        ? allKeys
+        : allKeys
+            .where((String key) => key.startsWith(_profileWing))
+            .toList(growable: false);
     final int occupiedCount =
         keys.where((String key) => slotMap[key]?.occupied == true).length;
     final int availableCount = keys.length - occupiedCount;
@@ -552,7 +500,8 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
                 onTap: () {
                   final List<String> parts = key.split('-P');
                   setState(() {
-                    _selectedWing = parts.first;
+                    _selectedWing = _isAdmin ? parts.first : _profileWing;
+                    _wingController.text = _selectedWing;
                     _selectedPoint = int.tryParse(parts.last) ?? 1;
                   });
                   if (occupied) {
@@ -634,6 +583,7 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
         final Map<String, dynamic> profile =
             profileSnapshot.data!.data() ?? <String, dynamic>{};
         _hydrateProfile(profile, user?.email ?? '');
+        _ensureVehicleSchema(uid, profile);
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
           stream: FirebaseFirestore.instance
               .collection('appConfig')
@@ -658,307 +608,242 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
                 final bool selectedPointOccupied =
                     selectedSlot?.occupied == true;
                 return StreamBuilder<ChargingSession?>(
-                  stream: _sessionRepository
-                      .watchActiveSessionForPoint(_selectedPointKey),
+                  stream: _sessionRepository.watchActiveSessionForOwner(uid),
                   builder: (BuildContext context,
-                      AsyncSnapshot<ChargingSession?> activeSnapshot) {
-                    final ChargingSession? activeSession = activeSnapshot.data;
-                    final bool hasActiveSession = activeSession != null;
-                    return Scaffold(
-                      appBar: AppBar(
-                        title: Text(
-                          _displayName.isEmpty
-                              ? 'Charging Session Entry'
-                              : 'Charging Session - $_displayName',
-                        ),
-                        actions: <Widget>[
-                          IconButton(
-                            onPressed: _showProfileSheet,
-                            icon: const Icon(Icons.account_circle),
-                          ),
-                        ],
-                      ),
-                      body: ListView(
-                        padding: const EdgeInsets.all(16),
-                        children: <Widget>[
-                          _pointBoard(slotMap),
-                          const SizedBox(height: 14),
-                          TextField(
-                            controller: _nameController,
-                            decoration: const InputDecoration(
-                                labelText: 'Resident Name'),
-                          ),
-                          const SizedBox(height: 12),
-                          DropdownButtonFormField<String>(
-                            initialValue: _selectedWing,
-                            decoration:
-                                const InputDecoration(labelText: 'Wing'),
-                            items: const <DropdownMenuItem<String>>[
-                              DropdownMenuItem<String>(
-                                  value: 'B1', child: Text('B1')),
-                              DropdownMenuItem<String>(
-                                  value: 'B2', child: Text('B2')),
+                      AsyncSnapshot<ChargingSession?> myActiveSnapshot) {
+                    final ChargingSession? myActiveSession =
+                        myActiveSnapshot.data;
+                    _autoSelectMyActivePoint(myActiveSession);
+                    return StreamBuilder<ChargingSession?>(
+                      stream: _sessionRepository
+                          .watchActiveSessionForPoint(_selectedPointKey),
+                      builder: (BuildContext context,
+                          AsyncSnapshot<ChargingSession?> activeSnapshot) {
+                        final ChargingSession? activeSession =
+                            activeSnapshot.data;
+                        final bool hasActiveSession = activeSession != null;
+                        return Scaffold(
+                          appBar: AppBar(
+                            title: Text(
+                              _displayName.isEmpty
+                                  ? 'Charging Session Entry'
+                                  : 'Charging Session - $_displayName',
+                            ),
+                            actions: <Widget>[
+                              IconButton(
+                                onPressed: _showProfileSheet,
+                                icon: const Icon(Icons.account_circle),
+                              ),
                             ],
-                            onChanged: (String? value) {
-                              if (value == null) {
-                                return;
-                              }
-                              setState(() {
-                                _selectedWing = value;
-                              });
-                            },
                           ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _flatNumberController,
-                            decoration: const InputDecoration(
-                              labelText: 'Flat Number',
-                              hintText: 'e.g. 1203 or 05-03',
-                            ),
-                            onChanged: (_) => setState(() {}),
-                          ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _vehicleController,
-                            decoration: const InputDecoration(
-                                labelText: 'Vehicle Number'),
-                          ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _startMeterController,
-                            keyboardType: TextInputType.number,
-                            enabled: !hasActiveSession,
-                            decoration: InputDecoration(
-                              labelText: 'Start Meter Reading (kWh)',
-                              helperText: hasActiveSession
-                                  ? 'Start meter locked while session is active.'
-                                  : 'Enter this only while starting charging.',
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _endMeterController,
-                            keyboardType: TextInputType.number,
-                            enabled: hasActiveSession,
-                            decoration: InputDecoration(
-                              labelText: 'End Meter Reading (kWh)',
-                              helperText: hasActiveSession
-                                  ? 'Enter end meter, then tap Stop Charging.'
-                                  : 'Enabled only after charging has started.',
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.blueGrey.withValues(alpha: 0.08),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: Colors.blueGrey.withValues(alpha: 0.3),
+                          body: ListView(
+                            padding: const EdgeInsets.all(16),
+                            children: <Widget>[
+                              _pointBoard(slotMap),
+                              const SizedBox(height: 14),
+                              TextField(
+                                controller: _nameController,
+                                readOnly: true,
+                                decoration: const InputDecoration(
+                                  labelText: 'Flat Owner Name',
+                                  helperText: 'Auto-filled from your profile',
+                                ),
                               ),
-                            ),
-                            child: Text(
-                              'Rate per Unit (admin config): INR ${effectiveRate.toStringAsFixed(2)}',
-                              style:
-                                  const TextStyle(fontWeight: FontWeight.w600),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Selected: $_selectedPointKey | '
-                            '${selectedPointOccupied ? 'Unavailable' : 'Available'}',
-                          ),
-                          if (selectedPointOccupied && selectedSlot != null)
-                            Text(
-                              'Occupied by ${selectedSlot.residentName} (${selectedSlot.flatNumber})',
-                            ),
-                          const SizedBox(height: 12),
-                          FilledButton(
-                            onPressed: (_isProcessingSession ||
-                                    selectedPointOccupied ||
-                                    hasActiveSession)
-                                ? null
-                                : () => _startCharging(effectiveRate),
-                            child: const Text('Start Charging'),
-                          ),
-                          const SizedBox(height: 8),
-                          FilledButton(
-                            onPressed:
-                                (_isProcessingSession || !hasActiveSession)
-                                    ? null
-                                    : () => _stopCharging(activeSession),
-                            child: const Text('Stop Charging'),
-                          ),
-                          if (hasActiveSession) ...<Widget>[
-                            const SizedBox(height: 8),
-                            Text(
-                              'Active session for ${activeSession.pointKey}: '
-                              '${activeSession.vehicleNumber} | '
-                              'Start Meter ${activeSession.startMeter.toStringAsFixed(2)}',
-                            ),
-                          ],
-                          const SizedBox(height: 20),
-                          FilledButton.icon(
-                            onPressed:
-                                _isExporting ? null : _exportMyHistoryCsv,
-                            icon: const Icon(Icons.download),
-                            label: Text(_isExporting
-                                ? 'Exporting...'
-                                : 'Download My History'),
-                          ),
-                          if (_isAdmin) ...<Widget>[
-                            const SizedBox(height: 8),
-                            FilledButton.icon(
-                              onPressed:
-                                  _isExporting ? null : _exportAdminB1B2Excel,
-                              icon: const Icon(Icons.admin_panel_settings),
-                              label: Text(
-                                _isExporting
-                                    ? 'Exporting...'
-                                    : 'Download Final Excel Report',
+                              const SizedBox(height: 12),
+                              TextField(
+                                controller: _wingController,
+                                readOnly: true,
+                                decoration: const InputDecoration(
+                                  labelText: 'Wing',
+                                  helperText: 'Auto-filled from your profile',
+                                ),
                               ),
-                            ),
-                          ],
-                          const SizedBox(height: 12),
-                          TextField(
-                            controller: _historyFilterController,
-                            decoration: const InputDecoration(
-                              labelText: 'Vehicle History Filter',
-                              hintText: 'Enter vehicle number (optional)',
-                            ),
-                            onChanged: (String value) {
-                              setState(() {
-                                _historyFilter = value.trim().toUpperCase();
-                              });
-                            },
-                          ),
-                          const SizedBox(height: 10),
-                          const Text(
-                            'Flat-wise History',
-                            style: TextStyle(fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 8),
-                          StreamBuilder<List<ChargingSession>>(
-                            stream: _sessionRepository.watchRecentSessions(
-                              ownerUid: _isAdmin ? null : uid,
-                              vehicleFilter: _historyFilter,
-                              wingFilter: _isAdmin ? _selectedWing : null,
-                              flatNumberFilter: _isAdmin ? _flatFilter : null,
-                            ),
-                            builder: (BuildContext context,
-                                AsyncSnapshot<List<ChargingSession>> snapshot) {
-                              if (snapshot.hasError) {
-                                return Text(
-                                    'History load failed: ${snapshot.error}');
-                              }
-                              if (!snapshot.hasData) {
-                                return const Padding(
-                                  padding: EdgeInsets.all(8),
-                                  child: CircularProgressIndicator(),
-                                );
-                              }
-                              final List<ChargingSession> sessions =
-                                  snapshot.data!;
-                              if (sessions.isEmpty) {
-                                return const Text('No session history yet.');
-                              }
-                              final List<ChargingSession> completed = sessions
-                                  .where((ChargingSession s) =>
-                                      s.status == 'completed')
-                                  .toList();
-                              final Map<String, _MonthlySummary> monthSummary =
-                                  <String, _MonthlySummary>{};
-                              for (final ChargingSession s in completed) {
-                                final DateTime at = s.endTime ?? s.createdAt;
-                                final String key =
-                                    DateFormat('yyyy-MM').format(at);
-                                final _MonthlySummary summary =
-                                    monthSummary.putIfAbsent(
-                                  key,
-                                  () => _MonthlySummary(month: key),
-                                );
-                                summary.units += s.units;
-                                summary.amount += s.amount;
-                                summary.sessions += 1;
-                              }
-                              final List<_MonthlySummary> summaryRows =
-                                  monthSummary.values.toList()
-                                    ..sort((_MonthlySummary a,
-                                            _MonthlySummary b) =>
-                                        b.month.compareTo(a.month));
-                              return Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: <Widget>[
-                                  if (_flatFilter.isNotEmpty) ...<Widget>[
-                                    const Text(
-                                      'Monthly Consumption Summary',
-                                      style: TextStyle(
-                                          fontWeight: FontWeight.w600),
-                                    ),
-                                    const SizedBox(height: 6),
-                                    if (summaryRows.isEmpty)
-                                      const Text(
-                                          'No completed sessions for summary.')
-                                    else
-                                      ...summaryRows.map((_MonthlySummary m) {
-                                        final DateTime monthDate =
-                                            DateTime.parse('${m.month}-01');
-                                        return Card(
-                                          color: Colors.teal
-                                              .withValues(alpha: 0.08),
-                                          child: ListTile(
-                                            title: Text(
-                                              DateFormat('MMMM yyyy')
-                                                  .format(monthDate),
-                                            ),
-                                            subtitle: Text(
-                                              'Sessions: ${m.sessions} | Units: ${m.units.toStringAsFixed(2)} kWh',
-                                            ),
-                                            trailing: Text(
-                                              'INR ${m.amount.toStringAsFixed(2)}',
-                                              style: const TextStyle(
-                                                fontWeight: FontWeight.w700,
-                                              ),
-                                            ),
-                                          ),
-                                        );
-                                      }),
-                                    const SizedBox(height: 10),
-                                  ],
-                                  const Text(
-                                    'Detailed Sessions',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w600),
+                              const SizedBox(height: 12),
+                              TextField(
+                                controller: _flatNumberController,
+                                readOnly: true,
+                                decoration: const InputDecoration(
+                                  labelText: 'Flat Number',
+                                  helperText: 'Auto-filled from your profile',
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              if (_savedVehicles.isNotEmpty) ...<Widget>[
+                                DropdownButtonFormField<String>(
+                                  initialValue: _selectedVehicle,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Saved Vehicle',
                                   ),
-                                  const SizedBox(height: 6),
-                                  ...sessions.map((ChargingSession s) {
-                                    final DateTime shownAt =
-                                        s.endTime ?? s.createdAt;
-                                    return Card(
-                                      child: ListTile(
-                                        title: Text(
-                                          '${s.vehicleNumber} | ${s.pointKey} | ${s.status.toUpperCase()}',
-                                        ),
-                                        subtitle: Text(
-                                          '${s.wing} ${s.flatNumber} | ${DateFormat('dd MMM yyyy, hh:mm a').format(shownAt)}\n'
-                                          'Start: ${s.startMeter.toStringAsFixed(2)}  End: ${s.endMeter.toStringAsFixed(2)}  Units: ${s.units.toStringAsFixed(2)} kWh',
-                                        ),
-                                        trailing: Text(
-                                          'INR ${s.amount.toStringAsFixed(2)}',
-                                          style: const TextStyle(
-                                            fontWeight: FontWeight.w700,
-                                          ),
-                                        ),
-                                      ),
-                                    );
-                                  }),
-                                ],
-                              );
-                            },
+                                  items: _savedVehicles
+                                      .map((String vehicle) =>
+                                          DropdownMenuItem<String>(
+                                            value: vehicle,
+                                            child: Text(vehicle),
+                                          ))
+                                      .toList(),
+                                  onChanged: _useGuestVehicle
+                                      ? null
+                                      : (String? value) {
+                                          if (value == null) {
+                                            return;
+                                          }
+                                          setState(() {
+                                            _selectedVehicle = value;
+                                          });
+                                        },
+                                ),
+                                const SizedBox(height: 8),
+                              ],
+                              SwitchListTile(
+                                contentPadding: EdgeInsets.zero,
+                                title: const Text('Charging a Guest Vehicle'),
+                                subtitle: const Text(
+                                    'Bill will still be linked to your flat/account'),
+                                value: _useGuestVehicle,
+                                onChanged: (bool value) {
+                                  setState(() {
+                                    _useGuestVehicle = value;
+                                  });
+                                },
+                              ),
+                              const SizedBox(height: 8),
+                              TextField(
+                                controller: _guestNameController,
+                                enabled: _useGuestVehicle,
+                                decoration: const InputDecoration(
+                                  labelText: 'Guest Name (Optional)',
+                                  helperText:
+                                      'If empty, flat owner name will be used.',
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              TextField(
+                                controller: _guestVehicleController,
+                                textCapitalization:
+                                    TextCapitalization.characters,
+                                enabled: _useGuestVehicle,
+                                decoration: InputDecoration(
+                                  labelText: _useGuestVehicle
+                                      ? 'Guest Vehicle Number'
+                                      : 'Vehicle Number',
+                                  helperText: _useGuestVehicle
+                                      ? 'Guest vehicle is one-time and not saved.'
+                                      : (_selectedVehicle == null
+                                          ? 'No saved vehicle found. Enable guest vehicle to continue.'
+                                          : 'Using saved vehicle ${_selectedVehicle!}'),
+                                ),
+                              ),
+                              if (!_useGuestVehicle) ...<Widget>[
+                                const SizedBox(height: 8),
+                                TextField(
+                                  controller: _manualVehicleController,
+                                  textCapitalization:
+                                      TextCapitalization.characters,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Vehicle Number (Manual Entry)',
+                                    helperText:
+                                        'Use this if your vehicle is not in saved list.',
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 12),
+                              TextField(
+                                controller: _startMeterController,
+                                keyboardType: TextInputType.number,
+                                enabled: !hasActiveSession,
+                                decoration: InputDecoration(
+                                  labelText: 'Start Meter Reading (kWh)',
+                                  helperText: hasActiveSession
+                                      ? 'Start meter locked while session is active.'
+                                      : 'Enter this only while starting charging.',
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              TextField(
+                                controller: _endMeterController,
+                                keyboardType: TextInputType.number,
+                                enabled: hasActiveSession,
+                                decoration: InputDecoration(
+                                  labelText: 'End Meter Reading (kWh)',
+                                  helperText: hasActiveSession
+                                      ? 'Enter end meter, then tap Stop Charging.'
+                                      : 'Enabled only after charging has started.',
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color:
+                                      Colors.blueGrey.withValues(alpha: 0.08),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color:
+                                        Colors.blueGrey.withValues(alpha: 0.3),
+                                  ),
+                                ),
+                                child: Text(
+                                  'Rate per Unit (admin config): INR ${effectiveRate.toStringAsFixed(2)}',
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              const Text(
+                                'Note: Rates may change subject to changes in MSEB rates and Society Management decision.',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black54,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Selected: $_selectedPointKey | '
+                                '${selectedPointOccupied ? 'Unavailable' : 'Available'}',
+                              ),
+                              if (selectedPointOccupied && selectedSlot != null)
+                                Text(
+                                  'Occupied by ${selectedSlot.residentName} (${selectedSlot.flatNumber})',
+                                ),
+                              const SizedBox(height: 12),
+                              FilledButton(
+                                onPressed: (_isProcessingSession ||
+                                        selectedPointOccupied ||
+                                        hasActiveSession)
+                                    ? null
+                                    : () => _startCharging(effectiveRate),
+                                child: const Text('Start Charging'),
+                              ),
+                              const SizedBox(height: 8),
+                              FilledButton(
+                                onPressed:
+                                    (_isProcessingSession || !hasActiveSession)
+                                        ? null
+                                        : () => _stopCharging(activeSession),
+                                child: const Text('Stop Charging'),
+                              ),
+                              if (myActiveSession != null &&
+                                  myActiveSession.pointKey != _selectedPointKey)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Text(
+                                    'You have an active session at ${myActiveSession.pointKey}. Point auto-selected for quick stop.',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                              if (hasActiveSession) ...<Widget>[
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Active session for ${activeSession.pointKey}: '
+                                  '${activeSession.vehicleNumber}${activeSession.isGuestVehicle ? ' (Guest)' : ''} | '
+                                  'Start Meter ${activeSession.startMeter.toStringAsFixed(2)}',
+                                ),
+                              ],
+                            ],
                           ),
-                        ],
-                      ),
+                        );
+                      },
                     );
                   },
                 );
@@ -1006,13 +891,4 @@ class _LegendChip extends StatelessWidget {
       ),
     );
   }
-}
-
-class _MonthlySummary {
-  _MonthlySummary({required this.month});
-
-  final String month;
-  int sessions = 0;
-  double units = 0;
-  double amount = 0;
 }

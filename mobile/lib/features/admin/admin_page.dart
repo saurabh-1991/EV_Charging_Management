@@ -12,6 +12,9 @@ import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../../core/flat_billing.dart';
+import '../../core/flat_payment_linker.dart';
+
 class AdminPage extends StatefulWidget {
   const AdminPage({super.key});
 
@@ -30,6 +33,7 @@ class _AdminPageState extends State<AdminPage> {
   final TextEditingController _newFlatController = TextEditingController();
   final TextEditingController _newVehicleController = TextEditingController();
   final TextEditingController _rateController = TextEditingController();
+  final TextEditingController _versionController = TextEditingController();
   final GoogleSignIn _googleSignIn = GoogleSignIn(
     scopes: <String>[drive.DriveApi.driveFileScope],
   );
@@ -40,6 +44,12 @@ class _AdminPageState extends State<AdminPage> {
   String _reportStage = '';
 
   @override
+  void initState() {
+    super.initState();
+    FlatPaymentLinker.ensureAll();
+  }
+
+  @override
   void dispose() {
     _newNameController.dispose();
     _newEmailController.dispose();
@@ -48,6 +58,7 @@ class _AdminPageState extends State<AdminPage> {
     _newFlatController.dispose();
     _newVehicleController.dispose();
     _rateController.dispose();
+    _versionController.dispose();
     super.dispose();
   }
 
@@ -97,6 +108,26 @@ class _AdminPageState extends State<AdminPage> {
     });
   }
 
+  Future<void> _saveAppVersion() async {
+    final String version = _versionController.text.trim();
+    if (version.isEmpty) {
+      _toast('Enter the current app version.');
+      return;
+    }
+    await FirebaseFirestore.instance
+        .collection('appConfig')
+        .doc('appVersion')
+        .set(
+      <String, dynamic>{
+        'currentVersion': version,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'updatedBy': FirebaseAuth.instance.currentUser?.uid,
+      },
+      SetOptions(merge: true),
+    );
+    _toast('App version published.');
+  }
+
   Future<void> _updatePaymentStatus(
     String paymentId,
     String status,
@@ -108,8 +139,9 @@ class _AdminPageState extends State<AdminPage> {
       'status': status,
       'verifiedBy': FirebaseAuth.instance.currentUser?.uid,
       'verifiedAt': FieldValue.serverTimestamp(),
+      'paidAt': status == 'paid' ? FieldValue.serverTimestamp() : null,
     });
-    _toast('Payment marked as $status.');
+    _toast('Payment marked as ${_paymentStatusLabel(status)}.');
     setState(() {
       _refreshSeed += 1;
     });
@@ -150,36 +182,72 @@ class _AdminPageState extends State<AdminPage> {
             .orderBy('createdAt', descending: true)
             .get();
 
-    final Map<String, _DueRow> rows = <String, _DueRow>{};
+    final Map<String, FlatProfileScope> scopes = <String, FlatProfileScope>{};
+    final Map<String, List<Map<String, dynamic>>> usersByFlat =
+        <String, List<Map<String, dynamic>>>{};
     for (final QueryDocumentSnapshot<Map<String, dynamic>> u
         in usersSnap.docs) {
-      final Map<String, dynamic> d = u.data();
-      rows[u.id] = _DueRow(
-        ownerUid: u.id,
-        name: (d['name'] ?? '-').toString(),
-        email: (d['email'] ?? '-').toString(),
-        wing: (d['wing'] ?? '-').toString(),
-        flat: (d['flatNumber'] ?? '-').toString(),
-      );
+      final FlatProfileScope? scope = FlatProfileScope.fromUser(u.data());
+      if (scope == null) {
+        continue;
+      }
+      scopes[u.id] = scope;
+      usersByFlat
+          .putIfAbsent(scope.key, () => <Map<String, dynamic>>[])
+          .add(u.data());
+    }
+
+    final Map<String, _DueRow> rows = <String, _DueRow>{};
+    String resolveKey(Map<String, dynamic> data) {
+      final String tagged = (data['billingFlatKey'] ?? '').toString();
+      if (tagged.isNotEmpty) {
+        return tagged;
+      }
+      final String? direct =
+          FlatBillMath.flatKey(data['wing'], data['flatNumber']);
+      if (direct != null) {
+        return direct;
+      }
+      final String uid = (data['ownerUid'] ?? '').toString();
+      return scopes[uid]?.key ?? 'uid:$uid';
+    }
+
+    _DueRow rowFor(String key, Map<String, dynamic> data) {
+      return rows.putIfAbsent(key, () {
+        final List<String> parts =
+            key.startsWith('uid:') ? <String>[] : key.split('|');
+        final String wing =
+            parts.length == 2 ? parts[0] : (data['wing'] ?? '-').toString();
+        final String flat = parts.length == 2
+            ? parts[1]
+            : (data['flatNumber'] ?? '-').toString();
+        final _DueRow row = _DueRow(
+          ownerUid: (data['ownerUid'] ?? '').toString(),
+          wing: wing,
+          flat: flat,
+        );
+        for (final Map<String, dynamic> user
+            in usersByFlat[key] ?? <Map<String, dynamic>>[]) {
+          row.addPerson(
+            (user['name'] ?? '').toString(),
+            (user['email'] ?? '').toString(),
+          );
+        }
+        if (row.names.isEmpty) {
+          row.addPerson((data['residentName'] ?? '').toString(), '');
+        }
+        return row;
+      });
     }
 
     for (final QueryDocumentSnapshot<Map<String, dynamic>> s
         in sessionsSnap.docs) {
       final Map<String, dynamic> d = s.data();
-      final String uid = (d['ownerUid'] ?? '').toString();
-      if (uid.isEmpty) {
+      final String key = resolveKey(d);
+      if (key == 'uid:') {
         continue;
       }
-      final _DueRow row = rows.putIfAbsent(
-        uid,
-        () => _DueRow(
-          ownerUid: uid,
-          name: (d['residentName'] ?? '-').toString(),
-          email: '-',
-          wing: (d['wing'] ?? '-').toString(),
-          flat: (d['flatNumber'] ?? '-').toString(),
-        ),
-      );
+      final _DueRow row = rowFor(key, d);
       row.units += (d['units'] as num?)?.toDouble() ?? 0;
       row.billAmount += (d['amount'] as num?)?.toDouble() ?? 0;
       row.sessionCount += 1;
@@ -188,21 +256,21 @@ class _AdminPageState extends State<AdminPage> {
     for (final QueryDocumentSnapshot<Map<String, dynamic>> p
         in paymentsSnap.docs) {
       final Map<String, dynamic> d = p.data();
-      final String uid = (d['ownerUid'] ?? '').toString();
-      if (uid.isEmpty || !rows.containsKey(uid)) {
+      final String key = resolveKey(d);
+      if (key == 'uid:') {
         continue;
       }
-      final _DueRow row = rows[uid]!;
+      final _DueRow row = rowFor(key, d);
       final String status = (d['status'] ?? 'submitted').toString();
       final double amount = (d['amount'] as num?)?.toDouble() ?? 0;
-      if (status == 'verified') {
+      if (FlatBillMath.isSettledStatus(status)) {
         row.paidAmount += amount;
       }
       if (status == 'submitted') {
         row.pendingRefs += 1;
       }
       row.lastTxnRef = (d['txnRef'] ?? row.lastTxnRef).toString();
-      row.lastPaymentStatus = status;
+      row.lastPaymentStatus = _paymentStatusLabel(status);
     }
 
     final List<_DueRow> dueRows = rows.values.toList()
@@ -252,8 +320,8 @@ class _AdminPageState extends State<AdminPage> {
     ]);
     for (final _DueRow row in dueRows) {
       summary.appendRow(<CellValue>[
-        TextCellValue(row.name),
-        TextCellValue(row.email),
+        TextCellValue(row.nameLabel),
+        TextCellValue(row.emailLabel),
         TextCellValue(row.wing),
         TextCellValue(row.flat),
         IntCellValue(row.sessionCount),
@@ -308,17 +376,32 @@ class _AdminPageState extends State<AdminPage> {
       TextCellValue('Txn Ref'),
       TextCellValue('Amount'),
       TextCellValue('Status'),
+      TextCellValue('Requested At'),
+      TextCellValue('Status Updated At'),
       TextCellValue('Verified By'),
     ]);
     for (final QueryDocumentSnapshot<Map<String, dynamic>> doc
         in paymentsSnap.docs) {
       final Map<String, dynamic> d = doc.data();
+      final DateTime? requestedAt =
+          (d['requestedAt'] as Timestamp?)?.toDate() ??
+              (d['createdAt'] as Timestamp?)?.toDate();
+      final DateTime? paidAt = (d['paidAt'] as Timestamp?)?.toDate() ??
+          (d['verifiedAt'] as Timestamp?)?.toDate();
       payments.appendRow(<CellValue>[
         TextCellValue((d['ownerUid'] ?? '').toString()),
         TextCellValue((d['monthKey'] ?? '').toString()),
         TextCellValue((d['txnRef'] ?? '').toString()),
         DoubleCellValue((d['amount'] as num?)?.toDouble() ?? 0),
-        TextCellValue((d['status'] ?? '').toString()),
+        TextCellValue(_paymentStatusLabel((d['status'] ?? '').toString())),
+        TextCellValue(
+          requestedAt == null
+              ? ''
+              : DateFormat('yyyy-MM-dd HH:mm').format(requestedAt),
+        ),
+        TextCellValue(
+          paidAt == null ? '' : DateFormat('yyyy-MM-dd HH:mm').format(paidAt),
+        ),
         TextCellValue((d['verifiedBy'] ?? '').toString()),
       ]);
     }
@@ -405,6 +488,19 @@ class _AdminPageState extends State<AdminPage> {
       return 'Google Drive authorization failed. Please sign in again.';
     }
     return 'Operation failed: $error';
+  }
+
+  String _paymentStatusLabel(String status) {
+    if (status == 'paid' || status == 'verified') {
+      return 'Paid';
+    }
+    if (status == 'submitted') {
+      return 'Pending Verification';
+    }
+    if (status == 'rejected') {
+      return 'Rejected';
+    }
+    return status;
   }
 
   Future<void> _uploadFileToDrive(File file) async {
@@ -603,14 +699,16 @@ class _AdminPageState extends State<AdminPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   const Text(
-                    'Users Dues & Consumption',
+                    'Flat Dues & Consumption',
                     style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
                   ...snapshot.data!.map((_DueRow row) => Card(
                         child: ListTile(
-                          title: Text('${row.name} (${row.flat})'),
+                          title: Text(
+                              '${row.nameLabel} (${row.wing} ${row.flat})'),
                           subtitle: Text(
+                            '${row.emailLabel}\n'
                             'Units: ${row.units.toStringAsFixed(2)} | '
                             'Bill: INR ${row.billAmount.toStringAsFixed(2)} | '
                             'Paid: INR ${row.paidAmount.toStringAsFixed(2)}\n'
@@ -660,6 +758,47 @@ class _AdminPageState extends State<AdminPage> {
                   FilledButton(
                     onPressed: _saveRateConfig,
                     child: const Text('Save'),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 20),
+          const Text(
+            'Published App Version',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+            stream: FirebaseFirestore.instance
+                .collection('appConfig')
+                .doc('appVersion')
+                .snapshots(),
+            builder: (BuildContext context,
+                AsyncSnapshot<DocumentSnapshot<Map<String, dynamic>>>
+                    snapshot) {
+              final String version = ((snapshot.data?.data() ??
+                          <String, dynamic>{})['currentVersion'] ??
+                      '')
+                  .toString();
+              if (_versionController.text.isEmpty && version.isNotEmpty) {
+                _versionController.text = version;
+              }
+              return Row(
+                children: <Widget>[
+                  Expanded(
+                    child: TextField(
+                      controller: _versionController,
+                      decoration: const InputDecoration(
+                        labelText: 'Current app version',
+                        helperText: 'Shown on the home dashboard',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  FilledButton(
+                    onPressed: _saveAppVersion,
+                    child: const Text('Publish'),
                   ),
                 ],
               );
@@ -740,15 +879,15 @@ class _AdminPageState extends State<AdminPage> {
                         'Txn ${data['txnRef'] ?? '-'} | INR ${((data['amount'] as num?)?.toDouble() ?? 0).toStringAsFixed(2)}',
                       ),
                       subtitle: Text(
-                        'Month: ${data['monthKey'] ?? '-'} | UID: ${data['ownerUid'] ?? '-'}',
+                        'Month: ${data['monthKey'] ?? '-'} | Flat: ${data['billingFlatKey'] ?? data['flatNumber'] ?? '-'} | UID: ${data['ownerUid'] ?? '-'}',
                       ),
                       trailing: Wrap(
                         spacing: 8,
                         children: <Widget>[
                           TextButton(
                             onPressed: () =>
-                                _updatePaymentStatus(doc.id, 'verified'),
-                            child: const Text('Verify'),
+                                _updatePaymentStatus(doc.id, 'paid'),
+                            child: const Text('Approve Paid'),
                           ),
                           TextButton(
                             onPressed: () =>
@@ -857,17 +996,15 @@ class _AdminPageState extends State<AdminPage> {
 class _DueRow {
   _DueRow({
     required this.ownerUid,
-    required this.name,
-    required this.email,
     required this.wing,
     required this.flat,
   });
 
   final String ownerUid;
-  final String name;
-  final String email;
   final String wing;
   final String flat;
+  final Set<String> names = <String>{};
+  final Set<String> emails = <String>{};
   int sessionCount = 0;
   double units = 0;
   double billAmount = 0;
@@ -875,6 +1012,21 @@ class _DueRow {
   int pendingRefs = 0;
   String lastTxnRef = '-';
   String lastPaymentStatus = '-';
+
+  void addPerson(String name, String email) {
+    final String trimmedName = name.trim();
+    final String trimmedEmail = email.trim();
+    if (trimmedName.isNotEmpty && trimmedName != '-') {
+      names.add(trimmedName);
+    }
+    if (trimmedEmail.isNotEmpty && trimmedEmail != '-') {
+      emails.add(trimmedEmail);
+    }
+  }
+
+  String get nameLabel => names.isEmpty ? '-' : names.join(', ');
+
+  String get emailLabel => emails.isEmpty ? '-' : emails.join(', ');
 
   double get dueAmount {
     final double due = billAmount - paidAmount;

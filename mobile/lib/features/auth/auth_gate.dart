@@ -62,8 +62,8 @@ class AuthGate extends StatelessWidget {
             }
             final Map<String, dynamic> data =
                 profileSnap.data?.data() ?? <String, dynamic>{};
-            final String status = (data['status'] ?? 'pending').toString();
-            if (status != 'active') {
+            final String status = (data['status'] ?? 'active').toString();
+            if (status == 'disabled') {
               return PendingApprovalPage(
                 email: user.email ?? '',
                 status: status,

@@ -22,8 +22,27 @@ service cloud.firestore {
 
     function isActiveUser() {
       return signedIn() &&
-          exists(/databases/$(database)/documents/users/$(myUid())) &&
-          myUser().status == 'active';
+          (!exists(/databases/$(database)/documents/users/$(myUid())) ||
+              myUser().status != 'disabled');
+    }
+
+    function hasProfile() {
+      return exists(/databases/$(database)/documents/users/$(myUid()));
+    }
+
+    function myFlatKey() {
+      return myUser().wing + '|' + myUser().flatNumber;
+    }
+
+    function sameFlatSession() {
+      return hasProfile() &&
+          resource.data.wing == myUser().wing &&
+          resource.data.flatNumber == myUser().flatNumber;
+    }
+
+    function sameFlatPayment() {
+      return hasProfile() &&
+          resource.data.billingFlatKey == myFlatKey();
     }
 
     match /users/{userId} {
@@ -31,7 +50,7 @@ service cloud.firestore {
       allow create: if signedIn() &&
           myUid() == userId &&
           request.resource.data.role == 'resident' &&
-          request.resource.data.status == 'pending';
+          request.resource.data.status in ['active', 'pending'];
       allow update: if isAdmin() ||
           (signedIn() &&
               myUid() == userId &&
@@ -47,16 +66,23 @@ service cloud.firestore {
 
     match /chargingSlots/{slotId} {
       allow read: if isActiveUser();
-      allow write: if isAdmin();
+      allow write: if isAdmin() || isActiveUser();
     }
 
     match /chargingSessions/{sessionId} {
       allow read: if isAdmin() ||
-          (isActiveUser() && resource.data.ownerUid == myUid());
+          (isActiveUser() && resource.data.ownerUid == myUid()) ||
+          (isActiveUser() && sameFlatSession());
       allow create: if isActiveUser() &&
           request.resource.data.ownerUid == myUid();
       allow update: if isAdmin() ||
           (isActiveUser() && resource.data.ownerUid == myUid());
+      allow delete: if false;
+    }
+
+    match /vehicles/{vehicleId} {
+      allow read: if isActiveUser();
+      allow create, update: if isActiveUser();
       allow delete: if false;
     }
 
@@ -81,10 +107,27 @@ service cloud.firestore {
 
     match /payments/{paymentId} {
       allow read: if isAdmin() ||
-          (isActiveUser() && resource.data.ownerUid == myUid());
+          (isActiveUser() && resource.data.ownerUid == myUid()) ||
+          (isActiveUser() && sameFlatPayment());
       allow create: if isActiveUser() &&
-          request.resource.data.ownerUid == myUid();
-      allow update: if isAdmin();
+          request.resource.data.ownerUid == myUid() &&
+          (
+            !('billingFlatKey' in request.resource.data) ||
+            request.resource.data.billingFlatKey == myFlatKey()
+          );
+      allow update: if isAdmin() ||
+          (isActiveUser() &&
+              resource.data.ownerUid == myUid() &&
+              request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['wing', 'flatNumber', 'billingFlatKey']) &&
+              request.resource.data.billingFlatKey == myFlatKey() &&
+              request.resource.data.wing == myUser().wing &&
+              request.resource.data.flatNumber == myUser().flatNumber &&
+              (
+                !('billingFlatKey' in resource.data) ||
+                resource.data.billingFlatKey == '' ||
+                resource.data.billingFlatKey == myFlatKey()
+              ));
       allow delete: if false;
     }
 
