@@ -1,5 +1,8 @@
 .DS_Store
 
+# Local editor files
+.cursor/
+
 # Build artifacts and distributables
 mobile/dist/*
 !mobile/dist/.gitkeep
