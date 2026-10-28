@@ -1,7 +1,15 @@
 # Google Drive Backup Guide
 
+## Live path (1.5.5 app)
+
+Admin Panel → **Upload Report to Google Drive**. The Flutter app signs in with Google (`drive.file` scope) and uploads the Excel all-users report to `EV Charging Reports/{yyyy-MM}`. No service account is required for this path.
+
+## Optional Python path
+
+`services/billing/` can still upload generated invoice PDFs if you run it by hand. That is not what residents or admins use in the app.
+
 ## Goal
-Upload monthly generated invoices from `services/billing/` into a society-owned Google Drive folder.
+Upload files into a society-owned Google Drive folder.
 
 ## One-Time Setup
 

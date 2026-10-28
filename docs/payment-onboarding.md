@@ -1,5 +1,7 @@
 # Payment Onboarding
 
+Residents submit the UPI/bank reference from **View Bills**. Admins verify it on **Admin Panel**. There is no in-app payment gateway.
+
 ## Launch Mode (No Gateway)
 
 1. Society provides:
