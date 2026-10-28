@@ -10,10 +10,13 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/flat_billing.dart';
 import '../../core/flat_payment_linker.dart';
+import '../sessions/session_repository.dart';
 
 class AdminPage extends StatefulWidget {
   const AdminPage({super.key});
@@ -42,11 +45,14 @@ class _AdminPageState extends State<AdminPage> {
   bool _isReportBusy = false;
   int _refreshSeed = 0;
   String _reportStage = '';
+  late final SessionRepository _sessionRepository =
+      SessionRepository(FirebaseFirestore.instance);
 
   @override
   void initState() {
     super.initState();
     FlatPaymentLinker.ensureAll();
+    _sessionRepository.ensureLastEndMeters();
   }
 
   @override
@@ -199,17 +205,25 @@ class _AdminPageState extends State<AdminPage> {
 
     final Map<String, _DueRow> rows = <String, _DueRow>{};
     String resolveKey(Map<String, dynamic> data) {
+      final String flat = (data['flatNumber'] ?? '').toString();
+      final String billingWing = (data['billingWing'] ?? '').toString();
+      if (billingWing.isNotEmpty && flat.isNotEmpty) {
+        return '$billingWing|$flat';
+      }
+      final String uid = (data['ownerUid'] ?? '').toString();
+      final FlatProfileScope? ownerScope = scopes[uid];
+      if (ownerScope != null && flat == ownerScope.flat) {
+        return ownerScope.key;
+      }
       final String tagged = (data['billingFlatKey'] ?? '').toString();
       if (tagged.isNotEmpty) {
         return tagged;
       }
-      final String? direct =
-          FlatBillMath.flatKey(data['wing'], data['flatNumber']);
+      final String? direct = FlatBillMath.flatKey(data['wing'], flat);
       if (direct != null) {
         return direct;
       }
-      final String uid = (data['ownerUid'] ?? '').toString();
-      return scopes[uid]?.key ?? 'uid:$uid';
+      return 'uid:$uid';
     }
 
     _DueRow rowFor(String key, Map<String, dynamic> data) {
@@ -280,7 +294,7 @@ class _AdminPageState extends State<AdminPage> {
         .toList();
   }
 
-  Future<File> _generateAdminReportFile({required bool uploadToDrive}) async {
+  Future<_AdminReportBundle> _loadAdminReportBundle() async {
     setState(() {
       _reportStage = 'Collecting billing and payment data...';
     });
@@ -296,8 +310,18 @@ class _AdminPageState extends State<AdminPage> {
         await FirebaseFirestore.instance
             .collection('payments')
             .where('monthKey', isEqualTo: _monthKey)
-            .orderBy('createdAt', descending: false)
+            .orderBy('createdAt', descending: true)
             .get();
+    return _AdminReportBundle(
+      dueRows: dueRows,
+      sessions: sessionsSnap.docs,
+      payments: paymentsSnap.docs.reversed.toList(),
+    );
+  }
+
+  Future<File> _generateAdminReportFile({required bool uploadToDrive}) async {
+    final _AdminReportBundle bundle = await _loadAdminReportBundle();
+    final List<_DueRow> dueRows = bundle.dueRows;
 
     setState(() {
       _reportStage = 'Building Excel workbook...';
@@ -349,7 +373,7 @@ class _AdminPageState extends State<AdminPage> {
       TextCellValue('End Time'),
     ]);
     for (final QueryDocumentSnapshot<Map<String, dynamic>> doc
-        in sessionsSnap.docs) {
+        in bundle.sessions) {
       final Map<String, dynamic> d = doc.data();
       final DateTime? start = (d['startTime'] as Timestamp?)?.toDate();
       final DateTime? end = (d['endTime'] as Timestamp?)?.toDate();
@@ -381,7 +405,7 @@ class _AdminPageState extends State<AdminPage> {
       TextCellValue('Verified By'),
     ]);
     for (final QueryDocumentSnapshot<Map<String, dynamic>> doc
-        in paymentsSnap.docs) {
+        in bundle.payments) {
       final Map<String, dynamic> d = doc.data();
       final DateTime? requestedAt =
           (d['requestedAt'] as Timestamp?)?.toDate() ??
@@ -432,6 +456,179 @@ class _AdminPageState extends State<AdminPage> {
       await Share.shareXFiles(<XFile>[XFile(file.path)],
           subject: 'Admin Billing Report ($_monthKey)');
       _toast('Admin report generated.');
+    } catch (e) {
+      _toast(_friendlyReportError(e));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isReportBusy = false;
+          _reportStage = '';
+        });
+      }
+    }
+  }
+
+  Future<void> _downloadAdminPdf() async {
+    setState(() => _isReportBusy = true);
+    try {
+      final _AdminReportBundle bundle = await _loadAdminReportBundle();
+      setState(() {
+        _reportStage = 'Building PDF...';
+      });
+      final pw.Document doc = pw.Document();
+      final pw.TextStyle headerStyle = pw.TextStyle(
+        fontSize: 8,
+        fontWeight: pw.FontWeight.bold,
+        color: PdfColors.white,
+      );
+      const pw.TextStyle cellStyle = pw.TextStyle(fontSize: 7);
+      const pw.BoxDecoration headerDecoration =
+          pw.BoxDecoration(color: PdfColors.teal);
+      doc.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4.landscape,
+          build: (pw.Context context) => <pw.Widget>[
+            pw.Header(
+              level: 0,
+              child: pw.Text('Society EV Admin Report'),
+            ),
+            pw.Text('Month: ${DateFormat('MMMM yyyy').format(_selectedMonth)}'),
+            pw.Text('Flats: ${bundle.dueRows.length}'),
+            pw.SizedBox(height: 10),
+            pw.Text(
+              'Flat summary',
+              style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+            ),
+            pw.SizedBox(height: 4),
+            pw.TableHelper.fromTextArray(
+              headerStyle: headerStyle,
+              cellStyle: cellStyle,
+              headerDecoration: headerDecoration,
+              headers: <String>[
+                'Name',
+                'Email',
+                'Wing',
+                'Flat',
+                'Sessions',
+                'Units',
+                'Bill',
+                'Paid',
+                'Due',
+                'Pending',
+                'Last status',
+              ],
+              data: bundle.dueRows
+                  .map((_DueRow row) => <String>[
+                        row.nameLabel,
+                        row.emailLabel,
+                        row.wing,
+                        row.flat,
+                        '${row.sessionCount}',
+                        row.units.toStringAsFixed(2),
+                        row.billAmount.toStringAsFixed(2),
+                        row.paidAmount.toStringAsFixed(2),
+                        row.dueAmount.toStringAsFixed(2),
+                        '${row.pendingRefs}',
+                        row.lastPaymentStatus,
+                      ])
+                  .toList(),
+            ),
+            pw.SizedBox(height: 12),
+            pw.Text(
+              'Sessions',
+              style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+            ),
+            pw.SizedBox(height: 4),
+            pw.TableHelper.fromTextArray(
+              headerStyle: headerStyle,
+              cellStyle: cellStyle,
+              headerDecoration: headerDecoration,
+              headers: <String>[
+                'Name',
+                'Wing',
+                'Flat',
+                'Point',
+                'Vehicle',
+                'Units',
+                'Amount',
+                'Start',
+                'End',
+              ],
+              data: bundle.sessions
+                  .map((QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+                final Map<String, dynamic> d = doc.data();
+                final DateTime? start = (d['startTime'] as Timestamp?)?.toDate();
+                final DateTime? end = (d['endTime'] as Timestamp?)?.toDate();
+                return <String>[
+                  (d['residentName'] ?? '').toString(),
+                  (d['wing'] ?? '').toString(),
+                  (d['flatNumber'] ?? '').toString(),
+                  (d['pointKey'] ?? '').toString(),
+                  (d['vehicleNumber'] ?? '').toString(),
+                  ((d['units'] as num?)?.toDouble() ?? 0).toStringAsFixed(2),
+                  ((d['amount'] as num?)?.toDouble() ?? 0).toStringAsFixed(2),
+                  start == null
+                      ? ''
+                      : DateFormat('yyyy-MM-dd HH:mm').format(start),
+                  end == null ? '' : DateFormat('yyyy-MM-dd HH:mm').format(end),
+                ];
+              }).toList(),
+            ),
+            pw.SizedBox(height: 12),
+            pw.Text(
+              'Payments',
+              style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+            ),
+            pw.SizedBox(height: 4),
+            pw.TableHelper.fromTextArray(
+              headerStyle: headerStyle,
+              cellStyle: cellStyle,
+              headerDecoration: headerDecoration,
+              headers: <String>[
+                'Txn Ref',
+                'Amount',
+                'Status',
+                'Requested',
+                'Updated',
+                'Wing',
+                'Flat',
+              ],
+              data: bundle.payments
+                  .map((QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+                final Map<String, dynamic> d = doc.data();
+                final DateTime? requestedAt =
+                    (d['requestedAt'] as Timestamp?)?.toDate() ??
+                        (d['createdAt'] as Timestamp?)?.toDate();
+                final DateTime? paidAt =
+                    (d['paidAt'] as Timestamp?)?.toDate() ??
+                        (d['verifiedAt'] as Timestamp?)?.toDate();
+                return <String>[
+                  (d['txnRef'] ?? '').toString(),
+                  ((d['amount'] as num?)?.toDouble() ?? 0).toStringAsFixed(2),
+                  _paymentStatusLabel((d['status'] ?? '').toString()),
+                  requestedAt == null
+                      ? ''
+                      : DateFormat('yyyy-MM-dd HH:mm').format(requestedAt),
+                  paidAt == null
+                      ? ''
+                      : DateFormat('yyyy-MM-dd HH:mm').format(paidAt),
+                  (d['billingWing'] ?? d['wing'] ?? '').toString(),
+                  (d['flatNumber'] ?? '').toString(),
+                ];
+              }).toList(),
+            ),
+          ],
+        ),
+      );
+      final List<int> bytes = await doc.save();
+      final Directory dir = await getApplicationDocumentsDirectory();
+      final File file = File(
+        '${dir.path}/admin_billing_${_monthKey}_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}.pdf',
+      );
+      await file.writeAsBytes(bytes, flush: true);
+      await Share.shareXFiles(<XFile>[XFile(file.path)],
+          subject: 'Admin Billing Report PDF ($_monthKey)');
+      _toast('Admin PDF generated.');
     } catch (e) {
       _toast(_friendlyReportError(e));
     } finally {
@@ -622,6 +819,122 @@ class _AdminPageState extends State<AdminPage> {
     );
   }
 
+  Future<void> _editLastMeter(String pointKey, double? current) async {
+    final TextEditingController controller = TextEditingController(
+      text: current == null ? '' : current.toStringAsFixed(2),
+    );
+    final String? action = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text('Last meter for $pointKey'),
+          content: TextField(
+            controller: controller,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(
+              labelText: 'Correct last end meter',
+              helperText:
+                  'The next session at this point must start above this reading.',
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop('clear'),
+              child: const Text('Clear'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop('save'),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    final String entered = controller.text.trim();
+    controller.dispose();
+    if (!mounted || action == null) {
+      return;
+    }
+    try {
+      if (action == 'clear') {
+        await _sessionRepository.setLastEndMeter(
+          pointKey: pointKey,
+          meter: null,
+        );
+        _toast('Last meter for $pointKey cleared.');
+        return;
+      }
+      final double? meter = double.tryParse(entered);
+      if (meter == null || meter < 0) {
+        _toast('Enter a valid meter reading.');
+        return;
+      }
+      await _sessionRepository.setLastEndMeter(pointKey: pointKey, meter: meter);
+      _toast('Last meter for $pointKey set to ${meter.toStringAsFixed(2)}.');
+    } on FirebaseException catch (e) {
+      _toast(e.message ?? e.code);
+    }
+  }
+
+  Widget _meterResetSection() {
+    const List<String> points = <String>[
+      'B1-P1',
+      'B1-P2',
+      'B2-P1',
+      'B2-P2',
+    ];
+    return StreamBuilder<Map<String, PointSlotStatus>>(
+      stream: _sessionRepository.watchPointStatuses(),
+      builder: (BuildContext context,
+          AsyncSnapshot<Map<String, PointSlotStatus>> snapshot) {
+        final Map<String, PointSlotStatus> slots =
+            snapshot.data ?? <String, PointSlotStatus>{};
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            const Text(
+              'Point meter readings',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'If a previous end reading is wrong, set the correct last meter. The next start at that point must be higher.',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+            const SizedBox(height: 8),
+            ...points.map((String pointKey) {
+              final PointSlotStatus? status = slots[pointKey];
+              final double? last = status?.lastEndMeter;
+              final bool occupied = status?.occupied == true;
+              return Card(
+                child: ListTile(
+                  title: Text(pointKey),
+                  subtitle: Text(
+                    occupied
+                        ? 'Charging now. Correct the reading after it stops.'
+                        : last == null
+                            ? 'No last meter saved.'
+                            : 'Last meter: ${last.toStringAsFixed(2)}',
+                  ),
+                  trailing: TextButton(
+                    onPressed:
+                        occupied ? null : () => _editLastMeter(pointKey, last),
+                    child: const Text('Set'),
+                  ),
+                ),
+              );
+            }),
+            const SizedBox(height: 16),
+          ],
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -631,6 +944,7 @@ class _AdminPageState extends State<AdminPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: <Widget>[
+          _meterResetSection(),
           const Text(
             'Billing & Dues Console',
             style: TextStyle(fontWeight: FontWeight.bold),
@@ -653,10 +967,16 @@ class _AdminPageState extends State<AdminPage> {
               Expanded(
                 child: FilledButton.icon(
                   onPressed: _isReportBusy ? null : _downloadAdminReport,
-                  icon: const Icon(Icons.download),
-                  label: Text(_isReportBusy
-                      ? 'Processing...'
-                      : 'Download All Users Report'),
+                  icon: const Icon(Icons.table_chart),
+                  label: Text(_isReportBusy ? 'Processing...' : 'Download Excel'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _isReportBusy ? null : _downloadAdminPdf,
+                  icon: const Icon(Icons.picture_as_pdf),
+                  label: const Text('Download PDF'),
                 ),
               ),
             ],
@@ -991,6 +1311,18 @@ class _AdminPageState extends State<AdminPage> {
       ),
     );
   }
+}
+
+class _AdminReportBundle {
+  const _AdminReportBundle({
+    required this.dueRows,
+    required this.sessions,
+    required this.payments,
+  });
+
+  final List<_DueRow> dueRows;
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>> sessions;
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>> payments;
 }
 
 class _DueRow {

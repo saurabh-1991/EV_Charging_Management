@@ -34,9 +34,15 @@ service cloud.firestore {
       return myUser().wing + '|' + myUser().flatNumber;
     }
 
-    function sameFlatSession() {
+    function sameFlatByPointWing() {
       return hasProfile() &&
           resource.data.wing == myUser().wing &&
+          resource.data.flatNumber == myUser().flatNumber;
+    }
+
+    function sameFlatByBillingWing() {
+      return hasProfile() &&
+          resource.data.billingWing == myUser().wing &&
           resource.data.flatNumber == myUser().flatNumber;
     }
 
@@ -72,7 +78,8 @@ service cloud.firestore {
     match /chargingSessions/{sessionId} {
       allow read: if isAdmin() ||
           (isActiveUser() && resource.data.ownerUid == myUid()) ||
-          (isActiveUser() && sameFlatSession());
+          (isActiveUser() && sameFlatByPointWing()) ||
+          (isActiveUser() && sameFlatByBillingWing());
       allow create: if isActiveUser() &&
           request.resource.data.ownerUid == myUid();
       allow update: if isAdmin() ||

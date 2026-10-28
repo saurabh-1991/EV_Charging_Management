@@ -78,8 +78,18 @@ class FlatBillMath {
     if (scope == null) {
       return (data['ownerUid'] ?? '').toString() == viewerUid;
     }
-    return (data['wing'] ?? '').toString() == scope.wing &&
-        (data['flatNumber'] ?? '').toString() == scope.flat;
+    final String flat = (data['flatNumber'] ?? '').toString();
+    final String homeWing = (data['billingWing'] ?? '').toString();
+    final String pointWing = (data['wing'] ?? '').toString();
+    final String ownerUid = (data['ownerUid'] ?? '').toString();
+    if (homeWing.isNotEmpty) {
+      return homeWing == scope.wing && flat == scope.flat;
+    }
+    if (ownerUid == viewerUid && flat == scope.flat) {
+      // Charging-point wing can be B1 while the flat's home wing is B2.
+      return true;
+    }
+    return pointWing == scope.wing && flat == scope.flat;
   }
 
   /// A payment reduces only the flat stored on it.

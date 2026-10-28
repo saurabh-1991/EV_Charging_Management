@@ -20,6 +20,87 @@ void main() {
     );
   });
 
+  test('B2 flat keeps the same account charges taken at B1 points', () {
+    const FlatProfileScope home = FlatProfileScope(wing: 'B2', flat: '1102');
+    final FlatBillTotals totals = FlatBillMath.summarize(
+      sessions: <Map<String, dynamic>>[
+        <String, dynamic>{
+          'status': 'completed',
+          'wing': 'B2',
+          'flatNumber': '1102',
+          'ownerUid': 'sahil',
+          'pointKey': 'B2-P1',
+          'units': 9,
+          'amount': 135,
+          'monthKey': '2026-10',
+        },
+        <String, dynamic>{
+          'status': 'completed',
+          'wing': 'B1',
+          'flatNumber': '1102',
+          'ownerUid': 'sahil',
+          'pointKey': 'B1-P2',
+          'units': 5.4,
+          'amount': 81,
+          'monthKey': '2026-10',
+        },
+        <String, dynamic>{
+          'status': 'completed',
+          'wing': 'B1',
+          'flatNumber': '1102',
+          'ownerUid': 'sahil',
+          'pointKey': 'B1-P1',
+          'units': 4,
+          'amount': 60,
+          'monthKey': '2026-10',
+        },
+        <String, dynamic>{
+          'status': 'completed',
+          'wing': 'B2',
+          'flatNumber': '1102',
+          'ownerUid': 'sahil',
+          'pointKey': 'B2-P1',
+          'units': 10.44,
+          'amount': 156.6,
+          'monthKey': '2026-10',
+        },
+        <String, dynamic>{
+          'status': 'completed',
+          'wing': 'B1',
+          'flatNumber': '1102',
+          'ownerUid': 'other-flat-resident',
+          'pointKey': 'B1-P1',
+          'units': 4,
+          'amount': 60,
+          'monthKey': '2026-10',
+        },
+      ],
+      payments: const <Map<String, dynamic>>[],
+      scope: home,
+      viewerUid: 'sahil',
+      monthKey: '2026-10',
+    );
+    expect(totals.units, closeTo(28.84, 0.001));
+    expect(totals.billed, closeTo(432.6, 0.001));
+    expect(
+      FlatBillMath.sessionCounts(
+        data: <String, dynamic>{
+          'status': 'completed',
+          'wing': 'B1',
+          'billingWing': 'B2',
+          'flatNumber': '1102',
+          'ownerUid': 'sahil',
+          'pointKey': 'B1-P1',
+          'monthKey': '2026-10',
+        },
+        scope: home,
+        viewerUid: 'flat-mate',
+        monthKey: '2026-10',
+      ),
+      isTrue,
+    );
+  });
+
   test('same flat number in another wing stays separate', () {
     expect(
       FlatBillMath.sessionCounts(

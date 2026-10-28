@@ -1,0 +1,5 @@
+{"sessionId":"e4dd45","timestamp":1793120318182,"location":"admin_page.dart:_generateAdminReportFile","message":"report start","data":{"monthKey":"2026-10"},"hypothesisId":"A","runId":"pre-fix"}
+{"sessionId":"e4dd45","timestamp":1793120319603,"location":"admin_page.dart:_loadDueRows","message":"due rows loaded","data":{"count":2},"hypothesisId":"A","runId":"pre-fix"}
+{"sessionId":"e4dd45","timestamp":1793120319972,"location":"admin_page.dart:sessionsQuery","message":"sessions query ok","data":{"count":8},"hypothesisId":"B","runId":"pre-fix"}
+{"sessionId":"e4dd45","timestamp":1793120320312,"location":"admin_page.dart:paymentsQuery","message":"payments query ok","data":{"count":3},"hypothesisId":"C","runId":"pre-fix"}
+{"sessionId":"e4dd45","timestamp":1793120320564,"location":"admin_page.dart:_downloadAdminPdf","message":"pdf encoded","data":{"bytes":6775,"summaryRows":2,"sessionRows":8,"paymentRows":3},"hypothesisId":"F","runId":"pre-fix"}

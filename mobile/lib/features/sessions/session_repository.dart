@@ -12,6 +12,7 @@ class SessionRepository {
     required String ownerUid,
     required String residentName,
     required String wing,
+    String? billingWing,
     required int floor,
     required String flatNumber,
     required int chargingPoint,
@@ -28,9 +29,10 @@ class SessionRepository {
       );
     }
     final String normalizedWing = wing.trim();
+    final String homeWing = (billingWing ?? normalizedWing).trim();
     final String normalizedFlat = flatNumber.trim().toUpperCase();
     final String? billingFlatKey =
-        FlatBillMath.flatKey(normalizedWing, normalizedFlat);
+        FlatBillMath.flatKey(homeWing, normalizedFlat);
     final String normalizedVehicle = vehicleNumber.trim().toUpperCase();
     if (normalizedVehicle.isEmpty) {
       throw FirebaseException(
@@ -62,6 +64,16 @@ class SessionRepository {
           plugin: 'cloud_firestore',
           code: 'slot-occupied',
           message: '$pointKey is currently unavailable.',
+        );
+      }
+      final double? lastEndMeter =
+          (slotDoc.data()?['lastEndMeter'] as num?)?.toDouble();
+      if (lastEndMeter != null && startMeter <= lastEndMeter) {
+        throw FirebaseException(
+          plugin: 'cloud_firestore',
+          code: 'invalid-meter',
+          message:
+              'Start meter must be greater than the last end meter (${lastEndMeter.toStringAsFixed(2)}) for $pointKey.',
         );
       }
 
@@ -96,6 +108,7 @@ class SessionRepository {
         'billingOwnerUid': ownerUid,
         'residentName': residentName,
         'wing': normalizedWing,
+        'billingWing': homeWing,
         if (billingFlatKey != null) 'billingFlatKey': billingFlatKey,
         'floor': floor,
         'flat': normalizedFlat,
@@ -220,6 +233,10 @@ class SessionRepository {
             'residentName': null,
             'flatNumber': null,
             'vehicleNumber': null,
+            'lastEndMeter': endMeter,
+            'lastEndedAt': now,
+            'lastMeterSetByAdmin': false,
+            'pointKey': pointKey,
             'updatedAt': now,
           },
           SetOptions(merge: true));
@@ -233,6 +250,108 @@ class SessionRepository {
       vehicleNumber: completedData['vehicleNumber']?.toString() ?? '',
       units: (completedData['units'] as num?)?.toDouble() ?? 0,
     );
+  }
+
+  Future<void> setLastEndMeter({
+    required String pointKey,
+    required double? meter,
+  }) async {
+    if (meter != null && meter < 0) {
+      throw FirebaseException(
+        plugin: 'cloud_firestore',
+        code: 'invalid-meter',
+        message: 'Meter reading cannot be negative.',
+      );
+    }
+    final DocumentReference<Map<String, dynamic>> slotRef =
+        _firestore.collection('chargingSlots').doc(pointKey);
+    final DocumentSnapshot<Map<String, dynamic>> slot = await slotRef.get();
+    if (slot.data()?['occupied'] == true) {
+      throw FirebaseException(
+        plugin: 'cloud_firestore',
+        code: 'slot-occupied',
+        message: '$pointKey is charging. Correct the reading after it stops.',
+      );
+    }
+    await slotRef.set(
+      <String, dynamic>{
+        'pointKey': pointKey,
+        'lastEndMeter': meter ?? FieldValue.delete(),
+        'lastEndedAt': meter == null
+            ? FieldValue.delete()
+            : FieldValue.serverTimestamp(),
+        'lastMeterSetByAdmin': true,
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+      SetOptions(merge: true),
+    );
+  }
+
+  Future<void> ensureLastEndMeters() async {
+    const List<String> points = <String>[
+      'B1-P1',
+      'B1-P2',
+      'B2-P1',
+      'B2-P2',
+    ];
+    try {
+      final QuerySnapshot<Map<String, dynamic>> completed = await _firestore
+          .collection('chargingSessions')
+          .where('status', isEqualTo: 'completed')
+          .get();
+      final Map<String, double> bestMeter = <String, double>{};
+      final Map<String, DateTime> bestAt = <String, DateTime>{};
+      for (final QueryDocumentSnapshot<Map<String, dynamic>> doc
+          in completed.docs) {
+        final Map<String, dynamic> data = doc.data();
+        final String pointKey = (data['pointKey'] ?? '').toString();
+        if (!points.contains(pointKey)) {
+          continue;
+        }
+        final double? endMeter = (data['endMeter'] as num?)?.toDouble();
+        if (endMeter == null) {
+          continue;
+        }
+        final DateTime endedAt = (data['endTime'] as Timestamp?)?.toDate() ??
+            (data['updatedAt'] as Timestamp?)?.toDate() ??
+            DateTime.fromMillisecondsSinceEpoch(0);
+        final DateTime? previous = bestAt[pointKey];
+        if (previous == null || endedAt.isAfter(previous)) {
+          bestAt[pointKey] = endedAt;
+          bestMeter[pointKey] = endMeter;
+        }
+      }
+      for (final MapEntry<String, double> entry in bestMeter.entries) {
+        final DocumentReference<Map<String, dynamic>> slotRef =
+            _firestore.collection('chargingSlots').doc(entry.key);
+        await _firestore.runTransaction((Transaction txn) async {
+          final DocumentSnapshot<Map<String, dynamic>> slot =
+              await txn.get(slotRef);
+          if (slot.data()?['lastMeterSetByAdmin'] == true) {
+            return;
+          }
+          final DateTime? storedAt =
+              (slot.data()?['lastEndedAt'] as Timestamp?)?.toDate();
+          final DateTime endedAt = bestAt[entry.key]!;
+          if (storedAt != null && !endedAt.isAfter(storedAt)) {
+            return;
+          }
+          txn.set(
+            slotRef,
+            <String, dynamic>{
+              'pointKey': entry.key,
+              'lastEndMeter': entry.value,
+              'lastEndedAt': Timestamp.fromDate(endedAt),
+              'updatedAt': FieldValue.serverTimestamp(),
+            },
+            SetOptions(merge: true),
+          );
+        });
+      }
+    } catch (_) {
+      // Residents cannot list every session. The slot value is still
+      // updated each time a session at that point is stopped.
+    }
   }
 
   Stream<Map<String, PointSlotStatus>> watchPointStatuses() {
@@ -250,6 +369,7 @@ class SessionRepository {
             flatNumber: (data['flatNumber'] ?? '').toString(),
             vehicleNumber: (data['vehicleNumber'] ?? '').toString(),
             startedAt: (data['startedAt'] as Timestamp?)?.toDate(),
+            lastEndMeter: (data['lastEndMeter'] as num?)?.toDouble(),
           );
         }
         return statuses;
@@ -436,6 +556,7 @@ class PointSlotStatus {
     required this.flatNumber,
     required this.vehicleNumber,
     required this.startedAt,
+    required this.lastEndMeter,
   });
 
   final String pointKey;
@@ -444,6 +565,7 @@ class PointSlotStatus {
   final String flatNumber;
   final String vehicleNumber;
   final DateTime? startedAt;
+  final double? lastEndMeter;
 }
 
 class ChargingSession {

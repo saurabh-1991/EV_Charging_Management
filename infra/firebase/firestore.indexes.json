@@ -116,6 +116,14 @@
       "collectionGroup": "chargingSessions",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "billingWing", "order": "ASCENDING" },
+        { "fieldPath": "flatNumber", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "chargingSessions",
+      "queryScope": "COLLECTION",
+      "fields": [
         { "fieldPath": "wing", "order": "ASCENDING" },
         { "fieldPath": "flatNumber", "order": "ASCENDING" },
         { "fieldPath": "vehicleNumber", "order": "ASCENDING" },

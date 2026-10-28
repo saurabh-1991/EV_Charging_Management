@@ -1,7 +1,7 @@
 name: ev_charging_management
 description: Society EV charging management app for Android and iOS.
 publish_to: "none"
-version: 1.5.3+8
+version: 1.5.5+10
 
 environment:
   sdk: ">=3.3.0 <4.0.0"

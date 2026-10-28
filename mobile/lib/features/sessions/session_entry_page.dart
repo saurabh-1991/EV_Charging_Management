@@ -107,7 +107,10 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     return _normalizeVehicle(_selectedVehicle ?? '');
   }
 
-  Future<void> _startCharging(double ratePerUnit) async {
+  Future<void> _startCharging(
+    double ratePerUnit,
+    double? lastEndMeter,
+  ) async {
     if (!widget.firebaseReady) {
       _toast('Firebase not configured yet.');
       return;
@@ -138,6 +141,13 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
       _toast('Please login first.');
       return;
     }
+    if (lastEndMeter != null && startMeter <= lastEndMeter) {
+      _toast(
+        'Start meter must be greater than the last end meter '
+        '(${lastEndMeter.toStringAsFixed(2)}) for $_selectedPointKey.',
+      );
+      return;
+    }
 
     setState(() {
       _isProcessingSession = true;
@@ -147,6 +157,7 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
         ownerUid: ownerUid,
         residentName: residentName,
         wing: sessionWing,
+        billingWing: _profileWing,
         floor: _deriveFloorFromFlat(flat),
         flatNumber: flat,
         chargingPoint: _selectedPoint,
@@ -308,6 +319,9 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
     _displayName = (profile['name'] ?? '').toString();
     _displayEmail = email;
     _isAdmin = (profile['role'] ?? '') == 'admin';
+    if (_isAdmin) {
+      _sessionRepository.ensureLastEndMeters();
+    }
     if (_displayName.isNotEmpty) {
       _nameController.text = _displayName;
     }
@@ -523,6 +537,12 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
                         ),
                         const SizedBox(height: 4),
                         Text(occupied ? 'Unavailable' : 'Available'),
+                        if (status?.lastEndMeter != null)
+                          Text(
+                            'Last meter: ${status!.lastEndMeter!.toStringAsFixed(2)}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         if (occupied && status != null) ...<Widget>[
                           Text(
                             status.vehicleNumber.isEmpty
@@ -749,13 +769,20 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
                               const SizedBox(height: 12),
                               TextField(
                                 controller: _startMeterController,
-                                keyboardType: TextInputType.number,
+                                keyboardType:
+                                    const TextInputType.numberWithOptions(
+                                  decimal: true,
+                                ),
                                 enabled: !hasActiveSession,
                                 decoration: InputDecoration(
                                   labelText: 'Start Meter Reading (kWh)',
                                   helperText: hasActiveSession
                                       ? 'Start meter locked while session is active.'
-                                      : 'Enter this only while starting charging.',
+                                      : selectedSlot?.lastEndMeter == null
+                                          ? 'No previous reading for $_selectedPointKey yet.'
+                                          : 'Last end meter at $_selectedPointKey: '
+                                              '${selectedSlot!.lastEndMeter!.toStringAsFixed(2)}. '
+                                              'Start must be greater.',
                                 ),
                               ),
                               const SizedBox(height: 12),
@@ -812,7 +839,10 @@ class _SessionEntryPageState extends State<SessionEntryPage> {
                                         selectedPointOccupied ||
                                         hasActiveSession)
                                     ? null
-                                    : () => _startCharging(effectiveRate),
+                                    : () => _startCharging(
+                                          effectiveRate,
+                                          selectedSlot?.lastEndMeter,
+                                        ),
                                 child: const Text('Start Charging'),
                               ),
                               const SizedBox(height: 8),

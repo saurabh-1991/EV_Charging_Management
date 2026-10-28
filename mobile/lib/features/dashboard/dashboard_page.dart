@@ -8,6 +8,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../core/flat_billing.dart';
 import '../../core/flat_payment_linker.dart';
+import '../../core/flat_session_merge.dart';
 import '../admin/admin_page.dart';
 import '../billing/billing_page.dart';
 import '../sessions/session_entry_page.dart';
@@ -114,19 +115,13 @@ class DashboardPage extends StatelessWidget {
         final FlatProfileScope? scope = FlatProfileScope.fromUser(userData);
         if (scope != null) {
           FlatPaymentLinker.ensureOwn(uid, scope);
+          FlatPaymentLinker.ensureOwnSessions(uid, scope);
         }
-        final Query<Map<String, dynamic>> sessionQuery = scope == null
-            ? FirebaseFirestore.instance
-                .collection('chargingSessions')
-                .where('ownerUid', isEqualTo: uid)
-            : FirebaseFirestore.instance
-                .collection('chargingSessions')
-                .where('wing', isEqualTo: scope.wing)
-                .where('flatNumber', isEqualTo: scope.flat);
-        return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-          stream: sessionQuery.snapshots(),
-          builder: (BuildContext context,
-              AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>> sessionSnap) {
+        return FlatSessionMerge(
+          uid: uid,
+          scope: scope,
+          builder: (List<QueryDocumentSnapshot<Map<String, dynamic>>>
+              loadedSessions) {
             return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
               stream: FirebaseFirestore.instance
                   .collection('payments')
@@ -145,9 +140,7 @@ class DashboardPage extends StatelessWidget {
                   builder: (BuildContext context,
                       AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>>
                           flatPaySnap) {
-                    if (sessionSnap.hasError ||
-                        ownPaySnap.hasError ||
-                        flatPaySnap.hasError) {
+                    if (ownPaySnap.hasError || flatPaySnap.hasError) {
                       return const Card(
                         child: ListTile(
                           title: Text('Usage snapshot unavailable'),
@@ -156,8 +149,7 @@ class DashboardPage extends StatelessWidget {
                         ),
                       );
                     }
-                    if (!sessionSnap.hasData ||
-                        !ownPaySnap.hasData ||
+                    if (!ownPaySnap.hasData ||
                         (scope != null && !flatPaySnap.hasData)) {
                       return const Card(
                         child: Padding(
@@ -181,7 +173,7 @@ class DashboardPage extends StatelessWidget {
                       ),
                     ]);
                     final FlatBillTotals totals = FlatBillMath.summarize(
-                      sessions: sessionSnap.data!.docs.map(
+                      sessions: loadedSessions.map(
                           (QueryDocumentSnapshot<Map<String, dynamic>> doc) =>
                               doc.data()),
                       payments: paymentData.values,

@@ -4,6 +4,8 @@ import 'flat_billing.dart';
 
 class FlatPaymentLinker {
   static final Map<String, Future<void>> _ownLinks = <String, Future<void>>{};
+  static final Map<String, Future<void>> _ownSessionLinks =
+      <String, Future<void>>{};
   static Future<void>? _allLinks;
 
   static Future<void> ensureOwn(String uid, FlatProfileScope scope) {
@@ -15,6 +17,27 @@ class FlatPaymentLinker {
         await _linkOwn(uid, scope);
       } catch (_) {
         _ownLinks.remove(uid);
+      }
+    });
+  }
+
+  static Future<void> ensureOwnSessions(String uid, FlatProfileScope scope) {
+    if (uid.isEmpty) {
+      return Future<void>.value();
+    }
+    return _ownSessionLinks.putIfAbsent(uid, () async {
+      try {
+        final QuerySnapshot<Map<String, dynamic>> snap = await FirebaseFirestore
+            .instance
+            .collection('chargingSessions')
+            .where('ownerUid', isEqualTo: uid)
+            .get();
+        await _commitLinks(
+          snap.docs,
+          (Map<String, dynamic> data) => _sessionHomeFields(data, scope),
+        );
+      } catch (_) {
+        _ownSessionLinks.remove(uid);
       }
     });
   }
@@ -138,6 +161,38 @@ class FlatPaymentLinker {
         return _adminFields(data, scope);
       },
     );
+    final QuerySnapshot<Map<String, dynamic>> sessionSnap =
+        await FirebaseFirestore.instance.collection('chargingSessions').get();
+    await _commitLinks(
+      sessionSnap.docs,
+      (Map<String, dynamic> data) {
+        final String ownerUid = (data['ownerUid'] ?? '').toString();
+        final FlatProfileScope? scope = scopes[ownerUid];
+        if (scope == null) {
+          return null;
+        }
+        return _sessionHomeFields(data, scope);
+      },
+    );
+  }
+
+  /// Keeps the charging-point wing, and records the resident's home wing.
+  static Map<String, dynamic>? _sessionHomeFields(
+    Map<String, dynamic> data,
+    FlatProfileScope scope,
+  ) {
+    final String flat = (data['flatNumber'] ?? '').toString();
+    if (flat != scope.flat) {
+      return null;
+    }
+    if ((data['billingWing'] ?? '').toString() == scope.wing &&
+        (data['billingFlatKey'] ?? '').toString() == scope.key) {
+      return null;
+    }
+    return <String, dynamic>{
+      'billingWing': scope.wing,
+      'billingFlatKey': scope.key,
+    };
   }
 
   /// A resident may only attach their own untagged payment to their current flat.

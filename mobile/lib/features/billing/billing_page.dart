@@ -10,6 +10,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../core/flat_billing.dart';
 import '../../core/flat_payment_linker.dart';
+import '../../core/flat_session_merge.dart';
 
 class BillingPage extends StatefulWidget {
   const BillingPage({super.key});
@@ -467,30 +468,15 @@ class _BillingPageState extends State<BillingPage> {
                     FlatProfileScope.fromUser(userData);
                 if (scope != null) {
                   FlatPaymentLinker.ensureOwn(uid, scope);
+                  FlatPaymentLinker.ensureOwnSessions(uid, scope);
                 }
-                final Query<Map<String, dynamic>> sessionQuery = scope == null
-                    ? FirebaseFirestore.instance
-                        .collection('chargingSessions')
-                        .where('ownerUid', isEqualTo: uid)
-                        .where('status', isEqualTo: 'completed')
-                        .where('monthKey', isEqualTo: _monthKey)
-                    : FirebaseFirestore.instance
-                        .collection('chargingSessions')
-                        .where('wing', isEqualTo: scope.wing)
-                        .where('flatNumber', isEqualTo: scope.flat);
-                return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                  stream: sessionQuery.snapshots(),
-                  builder: (BuildContext context,
-                      AsyncSnapshot<QuerySnapshot<Map<String, dynamic>>>
-                          sessionSnap) {
-                    if (sessionSnap.hasError) {
-                      return Text('Unable to load bills: ${sessionSnap.error}');
-                    }
-                    if (!sessionSnap.hasData) {
-                      return const CircularProgressIndicator();
-                    }
+                return FlatSessionMerge(
+                  uid: uid,
+                  scope: scope,
+                  builder: (List<QueryDocumentSnapshot<Map<String, dynamic>>>
+                      loadedSessions) {
                     final List<QueryDocumentSnapshot<Map<String, dynamic>>>
-                        sessionDocs = sessionSnap.data!.docs
+                        sessionDocs = loadedSessions
                             .where((QueryDocumentSnapshot<Map<String, dynamic>>
                                     doc) =>
                                 FlatBillMath.sessionCounts(
